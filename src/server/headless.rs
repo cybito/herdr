@@ -261,6 +261,7 @@ fn spawn_windows_client_accept_thread(
     listener: LocalListener,
     should_quit: Arc<AtomicBool>,
     server_event_tx: mpsc::Sender<ServerEvent>,
+    ime_control_enabled: bool,
 ) {
     std::thread::spawn(move || {
         let mut next_client_id = 1_u64;
@@ -293,6 +294,7 @@ fn spawn_windows_client_accept_thread(
                     client_id,
                     &server_event_tx,
                     &should_quit,
+                    ime_control_enabled,
                 ) {
                     debug!(client_id, err = %err, "client handshake failed");
                 }
@@ -330,7 +332,12 @@ impl HeadlessServer {
         // Channel for server events from client threads.
         let (server_event_tx, server_event_rx) = mpsc::channel(64);
         #[cfg(windows)]
-        spawn_windows_client_accept_thread(listener, should_quit.clone(), server_event_tx.clone());
+        spawn_windows_client_accept_thread(
+            listener,
+            should_quit.clone(),
+            server_event_tx.clone(),
+            app.ime_control_enabled,
+        );
 
         let server_keybindings = app_keybindings(&app);
         let headless_size = app.state.headless_size;
@@ -1101,6 +1108,7 @@ impl HeadlessServer {
             &mut self.next_client_id,
             &self.should_quit,
             &self.server_event_tx,
+            self.app.ime_control_enabled,
         )
     }
 
@@ -2912,6 +2920,14 @@ impl HeadlessServer {
             let _ = msg.respond_to.send(response);
             return false;
         }
+        if let Some(response) = self
+            .app
+            .input_intent_cancellation_response(&msg.request, msg.stream_active.as_deref())
+        {
+            let _ = msg.respond_to.send(response);
+            return false;
+        }
+
 
         let frozen_alt_screen_read = match self.alt_screen_read_conflict(&msg.request) {
             AltScreenReadConflict::None => None,
@@ -2927,7 +2943,7 @@ impl HeadlessServer {
             api::schema::Method::PaneGraphicsStreamOpen(params) => Some(params.clone()),
             _ => None,
         };
-        let stream_active = msg.stream_active.clone();
+        let stream_active = msg.stream_active;
 
         if let api::schema::Method::ServerLiveHandoff(params) = &msg.request.method {
             let handoff_result = self.perform_live_handoff(params.clone());
@@ -3088,7 +3104,10 @@ impl HeadlessServer {
             })
         } else {
             self.app
-                .handle_api_request_after_internal_events_drained(msg.request)
+                .handle_api_request_after_internal_events_drained_with_active(
+                    msg.request,
+                    stream_active.as_deref(),
+                )
         };
         if let Some(snapshot) = frozen_alt_screen_read {
             if let Ok(mut success) = serde_json::from_str::<api::schema::SuccessResponse>(&response)

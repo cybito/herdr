@@ -870,6 +870,7 @@ fn copy_mode_survives_mouse_motion_and_parks_across_focus_changes() {
         foreground_cwd: Some("/repo".into()),
         focused: true,
         right_click_passthrough: false,
+        terminal_id: None,
     });
     state.set_snapshot(Box::new(unfocused.clone()));
     assert_eq!(state.mode, ClientShellMode::Terminal);

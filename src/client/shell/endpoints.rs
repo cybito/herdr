@@ -308,6 +308,57 @@ impl ClientShellState {
             .count()
     }
 
+    pub(crate) fn validate_endpoint_input_intents(
+        &self,
+        endpoint_id: &ClientEndpointId,
+        generation: u64,
+        snapshot: &ClientShellSnapshot,
+        negotiation: &crate::client::endpoint::EndpointNegotiation,
+    ) -> Result<bool, crate::client::ClientError> {
+        let Some(endpoint) = self
+            .endpoints
+            .iter()
+            .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
+        else {
+            return Ok(false);
+        };
+        if endpoint.snapshot_generation == Some(generation)
+            && endpoint.snapshot.as_deref().is_some_and(|previous| {
+                previous.boot_id == snapshot.boot_id && previous.revision > snapshot.revision
+            })
+        {
+            return Ok(false);
+        }
+        if negotiation.supports_pane_input_intent() && snapshot.input_intents.is_none() {
+            return Err(crate::client::ClientError::InputIntentProtocolError);
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn require_endpoint_input_intents(
+        &self,
+        endpoint_id: &ClientEndpointId,
+        generation: u64,
+    ) -> Result<(), crate::client::ClientError> {
+        let current = self
+            .endpoints
+            .iter()
+            .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
+            .filter(|endpoint| endpoint.snapshot_generation == Some(generation))
+            .and_then(|endpoint| endpoint.snapshot.as_deref());
+        if !current.is_some_and(|snapshot| {
+            snapshot.input_intents.is_some()
+                && self.snapshot.as_deref().is_some_and(|projected| {
+                    &self.active_endpoint_id == endpoint_id
+                        && projected.boot_id == snapshot.boot_id
+                        && projected.revision == snapshot.revision
+                })
+        }) {
+            return Err(crate::client::ClientError::InputIntentProtocolError);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn cache_endpoint_snapshot(
         &mut self,

@@ -1,7 +1,7 @@
 use super::*;
 use crate::protocol::ClientPaneInputEvent;
 use crate::raw_input::RawInputEvent;
-use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 
 const LOCAL_INPUT_SOURCE: u8 = 0;
 
@@ -76,6 +76,21 @@ fn push_host_theme_update(
     requests.push(ClientMessage::ClientShellHostTheme { update });
 }
 
+#[cfg(any(unix, test))]
+pub(in crate::client) fn pixel_mouse_events(
+    data: &[u8],
+    geometry: crate::input::mouse::HostGeometry,
+) -> Option<(Vec<RawInputEvent>, crate::input::mouse::HostPixels)> {
+    let (x, y) = crate::input::mouse::parse_report(data)?;
+    let (column, row) = geometry.cell(x, y)?;
+    let report = crate::input::mouse::report_at_cell(data, column, row)?;
+    let events = crate::raw_input::parse_raw_input_bytes_sync(&report);
+    if events.len() != 1 || !matches!(events[0], RawInputEvent::Mouse(_)) {
+        return None;
+    }
+    Some((events, crate::input::mouse::HostPixels { x, y, geometry }))
+}
+
 impl ClientShellState {
     pub(crate) fn host_keyboard_report_all_requested(&self) -> bool {
         matches!(
@@ -84,7 +99,7 @@ impl ClientShellState {
         )
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(test)]
     pub(crate) fn handle_input_bytes(&mut self, data: &[u8]) -> ClientShellInput {
         self.handle_raw_events(crate::raw_input::parse_raw_input_bytes_sync(data))
     }
@@ -95,20 +110,10 @@ impl ClientShellState {
         data: &[u8],
         geometry: crate::input::mouse::HostGeometry,
     ) -> ClientShellInput {
-        let Some((x, y)) = crate::input::mouse::parse_report(data) else {
+        let Some((events, pixels)) = pixel_mouse_events(data, geometry) else {
             return ClientShellInput::default();
         };
-        let Some((column, row)) = geometry.cell(x, y) else {
-            return ClientShellInput::default();
-        };
-        let Some(cell_report) = crate::input::mouse::report_at_cell(data, column, row) else {
-            return ClientShellInput::default();
-        };
-        let events = crate::raw_input::parse_raw_input_bytes_sync(&cell_report);
-        if events.len() != 1 || !matches!(events[0], RawInputEvent::Mouse(_)) {
-            return ClientShellInput::default();
-        }
-        self.host_mouse_pixels = Some(crate::input::mouse::HostPixels { x, y, geometry });
+        self.host_mouse_pixels = Some(pixels);
         let outcome = self.handle_raw_events(events);
         self.host_mouse_pixels = None;
         outcome
@@ -123,7 +128,6 @@ impl ClientShellState {
             events
                 .iter()
                 .map(crate::protocol::ClientInputEvent::to_raw_input_event)
-                .collect(),
         )
     }
 
@@ -147,18 +151,21 @@ impl ClientShellState {
         events: Vec<crossterm::event::MouseEvent>,
     ) -> ClientShellInput {
         self.replaying_url_click = true;
-        let outcome =
-            self.handle_raw_events(events.into_iter().map(RawInputEvent::Mouse).collect());
+        let outcome = self.handle_raw_events(events.into_iter().map(RawInputEvent::Mouse));
         self.replaying_url_click = false;
         outcome
     }
 
-    pub(super) fn handle_raw_events(&mut self, events: Vec<RawInputEvent>) -> ClientShellInput {
+    pub(crate) fn handle_raw_events(&mut self, events: impl IntoIterator<Item = RawInputEvent>) -> ClientShellInput {
         let mut outcome = ClientShellInput::default();
-        if !events.is_empty() && self.endpoint_error.take().is_some() {
-            outcome.repaint = true;
-        }
         for event in events {
+            let dismiss_error = !self.ime_control_enabled
+                || matches!(&event, RawInputEvent::Key(key) if key.kind != KeyEventKind::Release)
+                || matches!(&event, RawInputEvent::Text(_) | RawInputEvent::Paste(_))
+                || matches!(&event, RawInputEvent::Mouse(mouse) if !matches!(mouse.kind, MouseEventKind::Up(_)));
+            if dismiss_error && self.endpoint_error.take().is_some() {
+                outcome.repaint = true;
+            }
             if let Some(update) = host_theme_update(&event) {
                 push_host_theme_update(&mut outcome.requests, update);
             }
@@ -292,7 +299,7 @@ impl ClientShellState {
         key: crate::input::TerminalKey,
         outcome: &mut ClientShellInput,
     ) {
-        if self.copy_operation_in_flight {
+        if self.copy_operation_in_flight && key.kind != KeyEventKind::Release {
             self.copy_input_queue.push_back(key);
             return;
         }
@@ -301,7 +308,7 @@ impl ClientShellState {
         match key.kind {
             KeyEventKind::Press => {
                 let initial_context = self.input_context();
-                let target = self.route_key_press(&key, outcome);
+                let target = self.route_key_press(&key, outcome).map(|target| self.bind_input_target(target));
                 if let Some(target) = target.as_ref() {
                     self.push_pane_key(target.clone(), key.clone(), outcome);
                 }
@@ -323,18 +330,22 @@ impl ClientShellState {
                 self.execute_repeat_plan(lease_key, key, plan, outcome);
             }
             KeyEventKind::Release => {
-                if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
-                    let release = lease
-                        .key
-                        .with_modifiers(key.modifiers)
-                        .with_kind(KeyEventKind::Release);
-                    self.push_pane_key(lease.target, release, outcome);
-                } else {
-                    let _ = self.input_leases.remove(&lease_key);
-                }
+                self.release_tracked_key(&key, outcome);
             }
         }
     }
+    pub(super) fn release_tracked_key(&mut self, key: &crate::input::TerminalKey, outcome: &mut ClientShellInput) -> bool {
+        let lease_key = crate::input::InputLeaseKey::new(LOCAL_INPUT_SOURCE, key);
+        if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
+            let release = lease.key.with_modifiers(key.modifiers).with_kind(KeyEventKind::Release);
+            self.push_pane_key(lease.target, release, outcome);
+            true
+        } else {
+            let _ = self.input_leases.remove(&lease_key);
+            false
+        }
+    }
+
 
     fn release_input_leases(&mut self, outcome: &mut ClientShellInput) {
         for lease in self.input_leases.remove_source(LOCAL_INPUT_SOURCE) {
@@ -364,6 +375,15 @@ impl ClientShellState {
             } else {
                 ClientInputTarget::Pane(gesture.hit.pane_id)
             };
+            let target = if let Some(route) = gesture.route {
+                match target {
+                    ClientInputTarget::Pane(pane_id) => ClientInputTarget::BoundPane { route, pane_id },
+                    ClientInputTarget::Popup(terminal_id) => ClientInputTarget::BoundPopup { route, terminal_id },
+                    bound => bound,
+                }
+            } else {
+                target
+            };
             super::push_target_event(
                 target,
                 ClientPaneInputEvent::Mouse {
@@ -390,6 +410,14 @@ impl ClientShellState {
     ) {
         match plan {
             crate::input::RepeatPlan::Forwarded(target) => {
+                let stale = match &target {
+                    ClientInputTarget::BoundPane { route, pane_id } =>
+                        self.input_route.as_ref() != Some(route) || self.popup_pending || self.popup_terminal_id.is_some() || self.focused_pane_id().as_ref() != Some(pane_id),
+                    ClientInputTarget::BoundPopup { route, terminal_id } =>
+                        self.input_route.as_ref() != Some(route) || self.popup_terminal_id.as_ref() != Some(terminal_id),
+                    _ => false,
+                };
+                if stale { return }
                 let pane_blocked_by_popup = matches!(&target, ClientInputTarget::Pane(_))
                     && (self.popup_pending || self.popup_terminal_id.is_some());
                 if !pane_blocked_by_popup {
@@ -483,6 +511,10 @@ impl ClientShellState {
         key: &crate::input::TerminalKey,
         outcome: &mut ClientShellInput,
     ) -> Option<ClientInputTarget> {
+        if self.ime_forward_prefix {
+            self.ime_forward_prefix = false;
+            return self.focused_pane_id().map(ClientInputTarget::Pane);
+        }
         if self.handle_modal_paste_shortcut_with(key, outcome, crate::platform::read_clipboard_text)
         {
             return None;
@@ -963,7 +995,7 @@ impl ClientShellState {
             overlay: self.overlay.as_ref().map(ClientShellOverlay::kind),
             popup_terminal_id: self.popup_input_target().and_then(|target| match target {
                 ClientInputTarget::Popup(terminal_id) => Some(terminal_id),
-                ClientInputTarget::Pane(_) => None,
+                _ => None,
             }),
             popup_pending: self.popup_pending,
             retained_selection: self
@@ -998,7 +1030,7 @@ impl ClientShellState {
         }
         if let Some(terminal_id) = self.popup_input_target().and_then(|target| match target {
             ClientInputTarget::Popup(terminal_id) => Some(terminal_id),
-            ClientInputTarget::Pane(_) => None,
+            _ => None,
         }) {
             return Some(crate::protocol::ClientClipboardImageTarget::Popup(
                 terminal_id,
@@ -1017,6 +1049,14 @@ impl ClientShellState {
             .map(|terminal_id| ClientInputTarget::Popup(terminal_id.clone()))
     }
 
+    pub(super) fn bind_input_target(&self, target: ClientInputTarget) -> ClientInputTarget {
+        match (self.input_route.as_ref(), target) {
+            (Some(route), ClientInputTarget::Pane(pane_id)) => ClientInputTarget::BoundPane { route: route.clone(), pane_id },
+            (Some(route), ClientInputTarget::Popup(terminal_id)) => ClientInputTarget::BoundPopup { route: route.clone(), terminal_id },
+            (_, target) => target,
+        }
+    }
+
     fn push_pane_key(
         &self,
         target: ClientInputTarget,
@@ -1030,7 +1070,7 @@ impl ClientShellState {
 
     fn push_focused_pane_event(&self, event: ClientPaneInputEvent, outcome: &mut ClientShellInput) {
         if let Some(pane_id) = self.focused_pane_id() {
-            super::push_target_event(ClientInputTarget::Pane(pane_id), event, outcome);
+            super::push_target_event(self.bind_input_target(ClientInputTarget::Pane(pane_id)), event, outcome);
         }
     }
 }

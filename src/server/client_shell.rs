@@ -122,6 +122,7 @@ pub(super) fn snapshot(
                 foreground_cwd: pane.foreground_cwd,
                 focused,
                 right_click_passthrough,
+                terminal_id: (app.ime_control_enabled && cfg!(unix)).then_some(pane.terminal_id),
             }
         })
         .collect();
@@ -240,6 +241,8 @@ pub(super) fn snapshot(
         panes,
         agents,
         commands: app.client_shell_command_manifest(),
+        input_intents: (app.ime_control_enabled && cfg!(unix))
+            .then(|| app.terminal_input_intents()),
     }
 }
 

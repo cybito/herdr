@@ -142,8 +142,9 @@ impl App {
             self.render_notify.clone(),
             self.render_dirty.clone(),
             extra_env,
+            self.ime_control_enabled,
         )?;
-        self.terminal_runtimes.insert(terminal.id.clone(), runtime);
+        self.install_terminal_runtime(terminal.id.clone(), runtime);
         self.state.terminals.insert(terminal.id.clone(), terminal);
         self.state.workspaces.push(ws);
         let idx = self.state.workspaces.len() - 1;

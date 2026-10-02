@@ -1500,6 +1500,12 @@
           ]
         },
         {
+          "key": "experimental.ime_control",
+          "type": "boolean",
+          "default": "false",
+          "description": "实验性 pane/Popup command/text 意图：server 仅记录语义，聚焦 client 通过本机 ime-control 管理 lease。server 与 client 都须启用；text 释放暂态英文，不强制中文。开启时 prefix 使用同一 daemon，关闭时旧 direct-switch 行为不变。仅支持具备本机图形 ime-control 服务的 macOS/Linux client；recorded ACK 不表示本机切源完成。"
+        },
+        {
           "key": "experimental.switch_ascii_input_source_in_prefix",
           "type": "boolean",
           "default": "false",

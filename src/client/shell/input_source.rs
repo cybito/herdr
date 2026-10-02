@@ -1,7 +1,7 @@
 use super::*;
 
 impl ClientShellState {
-    fn wants_ascii_input(&self) -> bool {
+    pub(super) fn wants_ascii_input(&self) -> bool {
         if let Some(overlay) = self.overlay.as_ref() {
             return matches!(
                 overlay,
@@ -23,6 +23,9 @@ impl ClientShellState {
     }
 
     pub(crate) fn reconcile_input_source(&mut self) {
+        if self.ime_control_enabled {
+            return;
+        }
         // Keep the platform restore token while another window has focus. Restoring
         // through a global key injection is only safe after this client regains focus.
         if self.outer_focused == Some(false) {

@@ -73,10 +73,10 @@ fn ctrl_click_without_a_link_replays_the_original_gesture() {
     );
     assert!(matches!(
         &actions[..],
-        [ClientShellAction::ReplayMouse(events)] if events == &vec![down]
+        [ClientShellAction::ReplayMouse(replay)] if replay.events == vec![down]
     ));
     let replay = match actions.into_iter().next().expect("replay action") {
-        ClientShellAction::ReplayMouse(events) => state.replay_mouse_events(events),
+        ClientShellAction::ReplayMouse(replay) => state.replay_mouse_events(replay.events),
         _ => unreachable!(),
     };
     assert!(matches!(

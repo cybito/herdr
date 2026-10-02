@@ -277,7 +277,7 @@ impl App {
             return false;
         }
 
-        self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        self.install_terminal_runtime(terminal_id.clone(), runtime);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.pending_agent_resume_plan = None;
             terminal.respawn_shell_on_exit = false;

@@ -22,6 +22,7 @@ pub const INPUT_CODEC_V1: &str = "shell.input.semantic.v1";
 pub const BLOB_CODEC_V1: &str = "shell.blob.v1";
 pub const SURFACE_INTEREST_CAPABILITY: &str = "surface_interest";
 pub const PRESENTATION_EFFECTS_FENCE_CAPABILITY: &str = "presentation_effects_fence";
+pub const PANE_INPUT_INTENT_CAPABILITY: &str = "pane_input_intent";
 pub const PRESENTATION_EFFECTS_SYNC_KIND: &str = "endpoint.presentation.sync.v1";
 pub const PRESENTATION_EFFECTS_READY_KIND: &str = "endpoint.presentation.ready.v1";
 pub const HEALTH_CHECK_CAPABILITY: &str = "health_check";
@@ -101,7 +102,15 @@ impl EndpointClientHello {
 }
 
 impl EndpointServerWelcome {
-    pub fn compatible(methods: Vec<String>) -> Self {
+    pub fn compatible(methods: Vec<String>, pane_input_intent: bool) -> Self {
+        let mut capabilities = vec![
+            SURFACE_INTEREST_CAPABILITY.into(),
+            PRESENTATION_EFFECTS_FENCE_CAPABILITY.into(),
+            HEALTH_CHECK_CAPABILITY.into(),
+        ];
+        if pane_input_intent {
+            capabilities.push(PANE_INPUT_INTENT_CAPABILITY.into());
+        }
         Self {
             generation: ENDPOINT_PROTOCOL_GENERATION,
             server_version: crate::build_info::version(),
@@ -110,11 +119,7 @@ impl EndpointServerWelcome {
             input_codec: INPUT_CODEC_V1.into(),
             blob_codec: BLOB_CODEC_V1.into(),
             methods,
-            capabilities: vec![
-                SURFACE_INTEREST_CAPABILITY.into(),
-                PRESENTATION_EFFECTS_FENCE_CAPABILITY.into(),
-                HEALTH_CHECK_CAPABILITY.into(),
-            ],
+            capabilities,
             error: None,
         }
     }
@@ -184,6 +189,7 @@ mod tests {
             panes: Vec::new(),
             agents: Vec::new(),
             commands: Vec::new(),
+            input_intents: None,
         }
     }
 
@@ -225,6 +231,8 @@ mod tests {
         )))
         .unwrap();
         assert_eq!(snapshot.boot_id, "boot-v1");
+        assert!(snapshot.input_intents.is_none());
+        assert!(snapshot.panes.iter().all(|pane| pane.terminal_id.is_none()));
         assert_eq!(
             snapshot.workspaces[0].agent_status,
             crate::api::schema::AgentStatus::Unknown
@@ -241,6 +249,69 @@ mod tests {
         assert_eq!(kind, ENDPOINT_SNAPSHOT_KIND);
         let decoded: ClientShellSnapshot = serde_json::from_str(&data).unwrap();
         assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn snapshot_control_preserves_complete_input_intent_rosters() {
+        use crate::api::schema::{
+            InputIntentPolicy, InputIntentSession, InputIntentState, TerminalInputIntents,
+        };
+
+        for roster in [
+            Vec::new(),
+            vec![TerminalInputIntents {
+                terminal_id: "popup-terminal".into(),
+                sessions: vec![
+                    InputIntentSession {
+                        session: "parent".into(),
+                        generation: 3,
+                        policy: InputIntentPolicy::Entry,
+                        state: InputIntentState::Command,
+                        active: false,
+                    },
+                    InputIntentSession {
+                        session: "child".into(),
+                        generation: 2,
+                        policy: InputIntentPolicy::Mode,
+                        state: InputIntentState::Text,
+                        active: true,
+                    },
+                ],
+            }],
+        ] {
+            let mut snapshot = snapshot();
+            snapshot.input_intents = Some(roster.into());
+            let ServerMessage::EndpointControl { kind, data } =
+                snapshot_message(&snapshot).unwrap()
+            else {
+                panic!("intent roster must use the stable JSON snapshot control");
+            };
+            assert_eq!(kind, SNAPSHOT_CODEC_V1);
+            let decoded: ClientShellSnapshot = serde_json::from_str(&data).unwrap();
+            assert_eq!(decoded, snapshot);
+        }
+    }
+
+    #[test]
+    fn snapshot_json_maps_future_input_intent_enums_to_unknown() {
+        let mut value = serde_json::to_value(snapshot()).unwrap();
+        value["input_intents"] = serde_json::json!([{
+            "terminal_id": "terminal",
+            "sessions": [{
+                "session": "future-reporter",
+                "generation": 8,
+                "policy": "future-policy",
+                "state": "future-state",
+                "active": true,
+                "future_lifecycle": "retained"
+            }],
+            "future_terminal": true
+        }]);
+        let decoded: ClientShellSnapshot = serde_json::from_value(value).unwrap();
+        let roster = decoded.input_intents.unwrap();
+        let session = &roster[0].sessions[0];
+        assert_eq!(session.policy, crate::api::schema::InputIntentPolicy::Unknown);
+        assert_eq!(session.state, crate::api::schema::InputIntentState::Unknown);
     }
 
     #[test]
@@ -276,19 +347,6 @@ mod tests {
     }
 
     #[test]
-    fn compatible_server_advertises_endpoint_lifecycle_capabilities() {
-        let welcome = EndpointServerWelcome::compatible(Vec::new());
-        assert_eq!(
-            welcome.capabilities,
-            vec![
-                SURFACE_INTEREST_CAPABILITY.to_string(),
-                PRESENTATION_EFFECTS_FENCE_CAPABILITY.to_string(),
-                HEALTH_CHECK_CAPABILITY.to_string(),
-            ]
-        );
-    }
-
-    #[test]
     fn required_codecs_are_explicit() {
         let mut value = hello();
         assert!(value.supports_required_codecs());
@@ -310,7 +368,7 @@ mod tests {
 
     #[test]
     fn welcome_ignores_future_named_fields() {
-        let welcome = EndpointServerWelcome::compatible(vec!["pane.close".into()]);
+        let welcome = EndpointServerWelcome::compatible(vec!["pane.close".into()], false);
         let mut value = serde_json::to_value(&welcome).unwrap();
         value["future_service"] = serde_json::json!("v2");
         let decoded: EndpointServerWelcome = serde_json::from_value(value).unwrap();

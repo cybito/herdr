@@ -93,6 +93,8 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
 pub(crate) struct PaneLaunchEnv {
     extra: Vec<(String, String)>,
     identity: PaneLaunchIdentity,
+    ime_control: bool,
+    popup_input_intent: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -112,6 +114,8 @@ impl PaneLaunchEnv {
         Self {
             extra,
             identity: PaneLaunchIdentity::Inherit,
+            ime_control: false,
+            popup_input_intent: None,
         }
     }
 
@@ -126,6 +130,16 @@ impl PaneLaunchEnv {
             tab_id,
             pane_id,
         };
+        self
+    }
+
+    pub(crate) fn with_input_intent(mut self, enabled: bool) -> Self {
+        self.ime_control = enabled;
+        self
+    }
+
+    pub(crate) fn with_popup_input_intent(mut self, terminal_id: String) -> Self {
+        self.popup_input_intent = Some(terminal_id);
         self
     }
 
@@ -156,6 +170,28 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
         }
         PaneLaunchIdentity::OmitPane => {
             cmd.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
+        }
+    }
+    use crate::integration::{HERDR_IME_INTENT_ENV_VAR, HERDR_IME_POPUP_TERMINAL_ID_ENV_VAR};
+    cmd.env_remove(HERDR_IME_POPUP_TERMINAL_ID_ENV_VAR);
+    if !launch_env.ime_control {
+        cmd.env_remove(HERDR_IME_INTENT_ENV_VAR);
+    } else if !cfg!(unix) {
+        cmd.env(HERDR_IME_INTENT_ENV_VAR, "unsupported");
+    } else {
+        match &launch_env.identity {
+            PaneLaunchIdentity::Managed { .. } => {
+                cmd.env(HERDR_IME_INTENT_ENV_VAR, "1");
+            }
+            PaneLaunchIdentity::OmitPane if launch_env.popup_input_intent.is_some() => {
+                cmd.env(HERDR_IME_INTENT_ENV_VAR, "1");
+                if let Some(terminal_id) = &launch_env.popup_input_intent {
+                    cmd.env(HERDR_IME_POPUP_TERMINAL_ID_ENV_VAR, terminal_id);
+                }
+            }
+            _ => {
+                cmd.env(HERDR_IME_INTENT_ENV_VAR, "unsupported");
+            }
         }
     }
 }

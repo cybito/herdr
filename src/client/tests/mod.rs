@@ -96,6 +96,217 @@ impl Drop for EnvVarGuard {
     }
 }
 
+#[derive(Clone)]
+struct LoopTestTransport {
+    messages: std::sync::mpsc::Sender<ClientMessage>,
+    disconnected: Arc<AtomicBool>,
+}
+
+fn loop_test_transport() -> (LoopTestTransport, std::sync::mpsc::Receiver<ClientMessage>) {
+    let (messages, received) = std::sync::mpsc::channel();
+    (
+        LoopTestTransport { messages, disconnected: Arc::new(AtomicBool::new(false)) },
+        received,
+    )
+}
+
+impl endpoint::EndpointTransport for LoopTestTransport {
+    fn send(&mut self, message: &ClientMessage) -> io::Result<()> {
+        self.messages.send(message.clone()).map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    fn disconnect(&mut self) {
+        self.disconnected.store(true, Ordering::Release);
+    }
+}
+
+fn loop_test_state() -> ClientState {
+    let mut shell = ClientShellState::new(ClientShellConfig::from_config(&crate::config::Config::default()));
+    shell.enable_ime_control();
+    let snapshot: crate::protocol::ClientShellSnapshot = serde_json::from_value(serde_json::json!({
+        "boot_id": "local-boot", "revision": 1, "input_intents": [],
+        "update_install_command": "herdr update", "latest_release_notes_available": false,
+        "integration_updates_available": false, "worktree_directory": "/fixture",
+        "tab_bar_right": [], "tab_bar_right_separator": " ", "agent_order": [],
+        "workspaces": [], "tabs": [], "panes": [], "agents": [], "commands": [],
+    })).unwrap();
+    shell.set_endpoint_snapshot_for_generation(&endpoint::ClientEndpointId::Local, 1, Box::new(snapshot));
+    shell.set_pane_surface(crate::protocol::PaneSurfaceFrame {
+        boot_id: "local-boot".into(), projection_revision: 1, surface_revision: 1,
+        frame: FrameData::from_ratatui_buffer_with_hyperlinks(
+            &ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            None, &[],
+        ),
+        panes: Vec::new(), splits: Vec::new(), popup: None, graphics: Default::default(),
+    });
+    ClientState {
+        blit_encoder: render_ansi::BlitEncoder::new(),
+        mouse_capture_active: false,
+        endpoint_mouse_capture_requested: false,
+        endpoint_sgr_pixels_requested: false,
+        host_theme_updates: Vec::new(),
+        direct_mouse_capture_preference: false,
+        shell_mouse_capture_preference: false,
+        direct_keyboard_protocol: crate::terminal_modes::DirectHostKeyboardState::default(),
+        pane_keyboard_report_all: false,
+        keyboard_report_all_active: false,
+        reported_size: (80, 24),
+        reported_cell_size: (0, 0),
+        sound_config: crate::config::SoundConfig::default(),
+        kitty_graphics_enabled: false,
+        pixel_geometry_enabled: false,
+        pixel_geometry_exact: false,
+        #[cfg(unix)]
+        direct_graphics_response: Arc::new(Mutex::new(direct_graphics::ResponseMatcher::default())),
+        #[cfg(unix)]
+        retired_direct_graphics: None,
+        #[cfg(unix)]
+        pending_surface_graphics: HashMap::new(),
+        attach_escape: None,
+        #[cfg(unix)]
+        mouse_scroll_lines: 3,
+        remote_image_paste_key: None,
+        redraw_on_focus_gained: false,
+        repaint_pending: false,
+        presentation_frozen: false,
+        draw_host_cursor: false,
+        detached_process_children: Vec::new(),
+        shell: Some(shell),
+    }
+}
+
+#[test]
+fn unsupported_ime_endpoint_activation_preserves_healthy_local_input() {
+    let now = std::time::Instant::now();
+    let profile = endpoint::SavedSshEndpoint::new("Stock server", "test-only", "default").unwrap();
+    let remote = endpoint::ClientEndpointId::Ssh(profile.id.clone());
+    let (local_transport, local_messages) = loop_test_transport();
+    let (remote_transport, _remote_messages) = loop_test_transport();
+    let mut endpoints = endpoint::EndpointRegistry::new(
+        local_transport.clone(),
+        1,
+        endpoint::EndpointNegotiation::new(
+            Vec::new(),
+            vec![crate::protocol::endpoint::PANE_INPUT_INTENT_CAPABILITY.into()],
+        ),
+    );
+    endpoints.insert(remote.clone(), remote_transport.clone(), 2, Default::default(), false);
+    let mut state = loop_test_state();
+    state.shell.as_mut().unwrap().set_endpoint_catalog(&[profile.clone()]);
+    state.shell.as_mut().unwrap().set_endpoint_status(&remote, endpoint::ClientEndpointStatus::Online);
+    let mut supervisors = endpoint::EndpointSupervisors::new(&[profile], now);
+    let mut commands = endpoint_commands::EndpointCommands::default();
+    let mut pending = None;
+
+    assert_eq!(
+        reject_unsupported_ime_endpoint(
+            &mut state, &mut endpoints, &mut commands, &mut supervisors, &mut pending,
+            &remote, true, now,
+        ),
+        Some(false),
+    );
+    assert_eq!(endpoints.active_id(), &endpoint::ClientEndpointId::Local);
+    assert!(endpoints.active_surface_available());
+    assert!(pending.is_none());
+    assert!(!state.presentation_frozen);
+    assert_eq!(
+        state.shell.as_ref().unwrap().endpoint_status(&remote),
+        Some(endpoint::ClientEndpointStatus::Attention),
+    );
+    assert!(remote_transport.disconnected.load(Ordering::Acquire));
+    assert!(!local_transport.disconnected.load(Ordering::Acquire));
+    assert!(matches!(local_messages.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+    let frame = state.shell.as_mut().unwrap().compose(100, 30).unwrap();
+    let text = frame.cells.iter().map(|cell| cell.symbol.as_str()).collect::<String>();
+    assert!(text.contains("IME_INTENT_UNSUPPORTED"), "refusal must remain visible: {text}");
+
+    require_client_input_intents(state.shell.as_ref(), &endpoints, true).unwrap();
+    let input = ClientMessage::Input { data: b"local remains usable".to_vec() };
+    assert_eq!(endpoints.send(&input), endpoint::EndpointSendOutcome::Sent);
+    assert_eq!(local_messages.try_iter().collect::<Vec<_>>(), vec![input]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ready_ime_input_and_endpoint_events_each_receive_bounded_turns() {
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+    let (supervisor_tx, mut supervisor_rx) = tokio::sync::mpsc::channel(16);
+    for _ in 0..16 {
+        assert!(event_tx.try_send(ClientLoopEvent::StdinInput(b"\x1b[O".to_vec())).is_ok());
+        assert!(supervisor_tx.try_send(endpoint::EndpointSupervisorEvent::Status {
+            endpoint_id: endpoint::ClientEndpointId::Local,
+            generation: 1,
+            status: endpoint::ClientEndpointStatus::Online,
+            message: String::new(),
+        }).is_ok());
+    }
+    let mut scheduler = ClientEventScheduler::default();
+    let mut scheduled = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut drains = 0;
+    let mut focus_reports = 0;
+    let mut endpoint_reports = 0;
+    for _ in 0..6 {
+        match scheduler.next(&mut scheduled, true, deadline, &mut event_rx, &mut supervisor_rx).await {
+            ClientLoopEvent::ImeDrain => drains += 1,
+            ClientLoopEvent::StdinInput(bytes) => {
+                assert!(matches!(
+                    crate::raw_input::parse_raw_input_bytes_sync(&bytes).as_slice(),
+                    [crate::raw_input::RawInputEvent::OuterFocusLost],
+                ));
+                focus_reports += 1;
+            }
+            ClientLoopEvent::EndpointSupervisor(_) => endpoint_reports += 1,
+            _ => panic!("unexpected scheduling result"),
+        }
+    }
+    assert!(drains >= 2, "already-authorized input must not wait behind sustained traffic");
+    assert!(focus_reports >= 1, "input dispatch must yield to real focus reports");
+    assert!(endpoint_reports >= 1, "reconnection results must remain consumable");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn due_timer_services_endpoint_health_before_ready_business_or_ime_work() {
+    let now = std::time::Instant::now();
+    let profile = endpoint::SavedSshEndpoint::new("Silent", "test-only", "default").unwrap();
+    let remote = endpoint::ClientEndpointId::Ssh(profile.id);
+    let (transport, messages) = loop_test_transport();
+    let mut endpoints = endpoint::EndpointRegistry::empty();
+    endpoints.insert(remote.clone(), transport.clone(), 2, endpoint::EndpointNegotiation::new(
+        Vec::new(), vec![crate::protocol::endpoint::HEALTH_CHECK_CAPABILITY.into()],
+    ), false);
+    endpoints.mark_ready(&remote, 2);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+    let (supervisor_tx, mut supervisor_rx) = tokio::sync::mpsc::channel(1);
+    assert!(event_tx.try_send(ClientLoopEvent::Resize(80, 24, 0, 0, false)).is_ok());
+    assert!(supervisor_tx.try_send(endpoint::EndpointSupervisorEvent::Status {
+        endpoint_id: remote.clone(), generation: 2,
+        status: endpoint::ClientEndpointStatus::Online, message: String::new(),
+    }).is_ok());
+    let mut scheduler = ClientEventScheduler::default();
+    let due = now - Duration::from_secs(1);
+    for ime_ready in [false, true] {
+        let mut scheduled = Some(ClientLoopEvent::ActivateEndpoint {
+            endpoint_id: remote.clone(), target: None, force: false,
+        });
+        assert!(matches!(
+            scheduler.next(&mut scheduled, ime_ready, due, &mut event_rx, &mut supervisor_rx).await,
+            ClientLoopEvent::Timer,
+        ));
+        assert!(scheduled.is_some(), "due maintenance must not discard a scheduled handoff");
+        endpoints.tick_health(now + if ime_ready { Duration::from_secs(20) } else { Duration::from_secs(6) });
+    }
+    assert!(matches!(
+        messages.try_iter().collect::<Vec<_>>().as_slice(),
+        [ClientMessage::EndpointControl { kind, .. }] if kind == crate::protocol::endpoint::HEALTH_PING_KIND,
+    ));
+    assert!(transport.disconnected.load(Ordering::Acquire));
+    let failures = endpoints.take_failures();
+    assert!(matches!(failures.as_slice(), [failure] if failure.endpoint_id == remote && failure.kind == io::ErrorKind::TimedOut));
+}
+
 #[test]
 fn windows_virtual_terminal_input_mode_sets_only_vti_bit() {
     assert_eq!(windows_virtual_terminal_input_mode(0x01f0), 0x03f0);

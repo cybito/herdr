@@ -27,7 +27,22 @@ impl App {
             .retain_mut(|child| retain_detached_process_after_wait(child.id(), child.try_wait()));
     }
 
+    pub(crate) fn install_terminal_runtime(
+        &mut self,
+        terminal_id: crate::terminal::TerminalId,
+        runtime: crate::terminal::TerminalRuntime,
+    ) {
+        if let Some(previous) = self
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime)
+        {
+            self.retire_input_intents_for_terminal(&terminal_id);
+            previous.shutdown();
+        }
+    }
+
     pub(crate) fn shutdown_terminal_runtime(&mut self, terminal_id: crate::terminal::TerminalId) {
+        self.retire_input_intents_for_terminal(&terminal_id);
         if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
             runtime.shutdown();
         }

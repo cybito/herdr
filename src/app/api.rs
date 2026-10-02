@@ -583,7 +583,7 @@ impl App {
             }
         };
 
-        self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        self.install_terminal_runtime(terminal_id.clone(), runtime);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.clear_agent_runtime_identity_after_respawn();
         }
@@ -886,6 +886,19 @@ impl App {
         &mut self,
         request: crate::api::schema::Request,
     ) -> String {
+        self.handle_api_request_after_internal_events_drained_with_active(request, None)
+    }
+
+    pub(crate) fn handle_api_request_after_internal_events_drained_with_active(
+        &mut self,
+        request: crate::api::schema::Request,
+        stream_active: Option<&std::sync::atomic::AtomicBool>,
+    ) -> String {
+        if let Some(response) =
+            self.input_intent_cancellation_response(&request, stream_active)
+        {
+            return response;
+        }
         self.sync_pending_terminal_titles();
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
@@ -1138,6 +1151,30 @@ impl App {
                     "stream_transport_required",
                     "pane.graphics.stream requires the streaming socket transport",
                 );
+            }
+            Method::PaneInputIntentStream(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "stream_transport_required",
+                    "pane.input_intent.stream requires the streaming socket transport",
+                );
+            }
+            Method::PaneInputIntentStreamOpen(params) => {
+                return self.handle_input_intent_stream_open(
+                    request.id,
+                    params,
+                    stream_active,
+                );
+            }
+            Method::PaneInputIntentStreamOperation(params) => {
+                return self.handle_input_intent_stream_operation(
+                    request.id,
+                    params,
+                    stream_active,
+                );
+            }
+            Method::PaneInputIntentStreamClose(params) => {
+                return self.handle_input_intent_stream_close(request.id, params);
             }
             Method::PaneGraphicsStreamSet(params) => {
                 return self.handle_pane_graphics_stream_set(request.id, params);

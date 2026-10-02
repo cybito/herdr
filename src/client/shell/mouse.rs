@@ -786,7 +786,14 @@ impl ClientShellState {
                     if button == gesture.button
             );
             if gesture_event {
+                if self.ime_control_enabled
+                    && !matches!(mouse.kind, MouseEventKind::Up(_))
+                    && gesture.route.as_ref() != self.input_route.as_ref()
+                {
+                    return;
+                }
                 let button = gesture.button;
+                let original_route = gesture.route.clone();
                 let modifiers = mouse.modifiers.difference(gesture.stripped_modifiers);
                 let hit = if gesture.hit.popup {
                     self.hits
@@ -807,7 +814,9 @@ impl ClientShellState {
                     gesture.last_event = mouse;
                     gesture.last_position = position;
                 }
+                let current_route = std::mem::replace(&mut self.input_route, original_route);
                 self.push_pane_mouse_event(&hit, mouse, modifiers, outcome);
+                self.input_route = current_route;
                 if mouse.kind == MouseEventKind::Up(button) {
                     self.pane_mouse_gesture = None;
                 }
@@ -830,6 +839,7 @@ impl ClientShellState {
                         self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
                         if hit.mouse_reporting {
                             self.pane_mouse_gesture = Some(ClientPaneMouseGesture {
+                                route: self.input_route.clone(),
                                 last_position: self.pane_mouse_position(&hit, mouse),
                                 hit,
                                 button,
@@ -900,6 +910,7 @@ impl ClientShellState {
                         pane_id,
                         inner_rect: hit.inner_rect,
                         fallback_events: vec![mouse],
+                        ime_origin: self.mouse_replay_origin(),
                     },
                     outcome,
                 );
@@ -1706,6 +1717,7 @@ impl ClientShellState {
                             outcome,
                         );
                         self.pane_mouse_gesture = Some(ClientPaneMouseGesture {
+                            route: self.input_route.clone(),
                             last_position: self.pane_mouse_position(&hit, mouse),
                             hit,
                             button: MouseButton::Right,
@@ -2120,6 +2132,7 @@ impl ClientShellState {
                     if hit.mouse_reporting && super::contains(hit.inner_rect, point) {
                         self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
                         self.pane_mouse_gesture = Some(ClientPaneMouseGesture {
+                            route: self.input_route.clone(),
                             last_position: self.pane_mouse_position(&hit, mouse),
                             hit: hit.clone(),
                             button: MouseButton::Left,
@@ -2156,12 +2169,14 @@ impl ClientShellState {
                             ));
                         }
                     }
-                    self.push_endpoint_method(
-                        crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
-                            pane_id: hit.pane_id,
-                        }),
-                        outcome,
-                    );
+                    if !self.ime_control_enabled || self.focused_pane_id().as_deref() != Some(hit.pane_id.as_str()) {
+                        self.push_endpoint_method(
+                            crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
+                                pane_id: hit.pane_id,
+                            }),
+                            outcome,
+                        );
+                    }
                 }
             }
             MouseEventKind::Down(MouseButton::Middle) => {
@@ -2174,6 +2189,7 @@ impl ClientShellState {
                 {
                     self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
                     self.pane_mouse_gesture = Some(ClientPaneMouseGesture {
+                        route: self.input_route.clone(),
                         last_position: self.pane_mouse_position(&hit, mouse),
                         hit,
                         button: MouseButton::Middle,
@@ -2274,7 +2290,7 @@ impl ClientShellState {
             ClientInputTarget::Pane(hit.pane_id.clone())
         };
         push_target_event(
-            target,
+            self.bind_input_target(target),
             ClientPaneInputEvent::Mouse {
                 kind,
                 position,

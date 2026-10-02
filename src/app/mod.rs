@@ -14,6 +14,7 @@ pub(crate) use api::test_support::exiting_test_command;
 mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod creation;
+mod input_intent;
 mod custom_commands;
 mod git_refresh;
 mod ids;
@@ -107,6 +108,8 @@ pub struct App {
     pub(crate) pane_graphics_files: Arc<crate::pane_graphics_files::FileStore>,
     pub(crate) direct_graphics_available: bool,
     pub(crate) pixel_mouse_available: bool,
+    pub(crate) ime_control_enabled: bool,
+    pub(crate) input_intents: crate::terminal::InputIntentStore,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
@@ -367,6 +370,7 @@ impl App {
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
 
+        let ime_control_enabled = config.experimental.ime_control;
         // Try to restore previous session
         let mut restored_terminals = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
@@ -378,19 +382,21 @@ impl App {
                 .pane_history
                 .then(crate::persist::load_history)
                 .flatten();
-            let (ws, terminals, terminal_runtimes) = crate::persist::restore(
-                &snap,
-                history.as_ref(),
-                24,
-                80,
-                config.advanced.scrollback_limit_bytes,
-                &config.terminal.default_shell,
-                config.terminal.shell_mode,
-                config.session.resume_agents_on_restore,
-                event_tx.clone(),
-                render_notify.clone(),
-                render_dirty.clone(),
-            );
+            let (ws, terminals, terminal_runtimes) =
+                crate::persist::restore(
+                    &snap,
+                    history.as_ref(),
+                    24,
+                    80,
+                    config.advanced.scrollback_limit_bytes,
+                    &config.terminal.default_shell,
+                    config.terminal.shell_mode,
+                    config.session.resume_agents_on_restore,
+                    ime_control_enabled,
+                    event_tx.clone(),
+                    render_notify.clone(),
+                    render_dirty.clone(),
+                );
             restored_terminals = terminals;
             restored_terminal_runtimes = terminal_runtimes.into();
             if ws.is_empty() {
@@ -573,6 +579,8 @@ impl App {
             pane_graphics_files: Arc::new(crate::pane_graphics_files::FileStore::default()),
             direct_graphics_available: false,
             pixel_mouse_available: false,
+            ime_control_enabled,
+            input_intents: crate::terminal::InputIntentStore::default(),
             terminal_runtimes: restored_terminal_runtimes,
             event_tx,
             event_rx,
@@ -645,16 +653,18 @@ impl App {
             api_rx,
             event_hub,
         );
-        let (workspaces, terminals, runtimes) = crate::persist::restore_handoff(
-            snapshot,
-            config.advanced.scrollback_limit_bytes,
-            &config.terminal.default_shell,
-            config.terminal.shell_mode,
-            imports,
-            app.event_tx.clone(),
-            app.render_notify.clone(),
-            app.render_dirty.clone(),
-        )?;
+        let (workspaces, terminals, runtimes) =
+            crate::persist::restore_handoff(
+                snapshot,
+                config.advanced.scrollback_limit_bytes,
+                &config.terminal.default_shell,
+                config.terminal.shell_mode,
+                config.experimental.ime_control,
+                imports,
+                app.event_tx.clone(),
+                app.render_notify.clone(),
+                app.render_dirty.clone(),
+            )?;
         let pane_id_aliases = crate::persist::handoff_pane_aliases(snapshot, &workspaces);
 
         app.state.pane_id_aliases = pane_id_aliases;
@@ -872,6 +882,10 @@ impl App {
             self.state.cjk_ime_agents = parse_cjk_ime_agents(&config.experimental.cjk_ime_agents);
             self.state.cjk_ime_cursor_shape =
                 config.experimental.cjk_ime_cursor_shape.to_decscusr();
+            self.ime_control_enabled = config.experimental.ime_control;
+            for workspace in &mut self.state.workspaces {
+                workspace.set_input_intent_enabled(self.ime_control_enabled);
+            }
             self.persist_pane_history = config.experimental.pane_history;
             if !self.persist_pane_history {
                 crate::persist::clear_history();

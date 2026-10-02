@@ -4,6 +4,8 @@ use super::*;
 mod pane_graphics_tests;
 #[path = "surface_interest.rs"]
 mod surface_interest_tests;
+#[path = "input_intent.rs"]
+mod input_intent_tests;
 
 fn client_shell_snapshot(message: ServerMessage) -> Box<crate::protocol::ClientShellSnapshot> {
     let ServerMessage::EndpointControl { kind, data } = message else {
@@ -29,17 +31,18 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
     );
 
     app.state.default_shell = crate::app::exiting_test_command().into();
+    static NEXT_TEST_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "hh-{}-{}",
+        "hh-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = fs::create_dir_all(&dir);
+    fs::create_dir(&dir).expect("create unique test directory");
     let socket_path = dir.join("client.sock");
-    let _ = fs::remove_file(&socket_path);
     let listener = bind_local_listener(&socket_path).expect("bind test listener");
     let client_socket_identity =
         socket_file_identity(&socket_path).expect("test listener socket identity");
@@ -50,7 +53,12 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
     let (server_event_tx, server_event_rx) = mpsc::channel(64);
     let should_quit = Arc::new(AtomicBool::new(false));
     #[cfg(windows)]
-    spawn_windows_client_accept_thread(listener, should_quit.clone(), server_event_tx.clone());
+    spawn_windows_client_accept_thread(
+        listener,
+        should_quit.clone(),
+        server_event_tx.clone(),
+        app.ime_control_enabled,
+    );
     let server_keybindings = app_keybindings(&app);
     let headless_size = app.state.headless_size;
 

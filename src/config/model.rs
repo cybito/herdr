@@ -1036,6 +1036,8 @@ impl Default for RemoteConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
+    /// Propagate pane intent and use the focused client's local IME lease. Default: false.
+    pub ime_control: bool,
     /// Allow launching herdr inside an existing herdr pane. Default: false.
     pub allow_nested: bool,
     /// Deprecated compatibility key for `terminal.kitty_graphics`.

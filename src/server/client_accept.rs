@@ -14,6 +14,7 @@ pub(crate) fn accept_pending_client_connections(
     next_client_id: &mut u64,
     should_quit: &Arc<AtomicBool>,
     server_event_tx: &mpsc::Sender<ServerEvent>,
+    ime_control_enabled: bool,
 ) -> io::Result<()> {
     loop {
         if should_quit.load(Ordering::Acquire) {
@@ -37,6 +38,7 @@ pub(crate) fn accept_pending_client_connections(
                         client_id,
                         &server_event_tx,
                         &should_quit,
+                        ime_control_enabled,
                     ) {
                         debug!(client_id, err = %err, "client handshake failed");
                     }

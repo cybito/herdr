@@ -37,6 +37,7 @@ struct PaneRestoreStartup<'a> {
 struct RestoreRuntimeContext<'a> {
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'a>,
+    ime_control_enabled: bool,
     resume_agents_on_restore: bool,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
@@ -71,6 +72,7 @@ pub fn restore(
     default_shell: &str,
     shell_mode: crate::config::ShellModeConfig,
     resume_agents_on_restore: bool,
+    ime_control_enabled: bool,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
@@ -84,6 +86,7 @@ pub fn restore(
         scrollback_limit_bytes,
         crate::pane::PaneShellConfig::new(default_shell, shell_mode),
         resume_agents_on_restore,
+        ime_control_enabled,
         &mut imported_panes,
         events,
         render_notify,
@@ -97,6 +100,7 @@ pub fn restore_handoff(
     scrollback_limit_bytes: usize,
     default_shell: &str,
     shell_mode: crate::config::ShellModeConfig,
+    ime_control_enabled: bool,
     imports: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
@@ -110,6 +114,7 @@ pub fn restore_handoff(
         scrollback_limit_bytes,
         crate::pane::PaneShellConfig::new(default_shell, shell_mode),
         true,
+        ime_control_enabled,
         imports,
         events,
         render_notify,
@@ -193,6 +198,7 @@ fn restore_with_imports_strict(
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'_>,
     resume_agents_on_restore: bool,
+    ime_control_enabled: bool,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
@@ -206,6 +212,7 @@ fn restore_with_imports_strict(
         scrollback_limit_bytes,
         shell_config,
         resume_agents_on_restore,
+        ime_control_enabled,
         imported_panes,
         events,
         render_notify,
@@ -233,6 +240,7 @@ fn restore_with_imports(
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'_>,
     resume_agents_on_restore: bool,
+    ime_control_enabled: bool,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
@@ -246,6 +254,7 @@ fn restore_with_imports(
         scrollback_limit_bytes,
         shell_config,
         resume_agents_on_restore,
+        ime_control_enabled,
         imported_panes,
         events,
         render_notify,
@@ -262,6 +271,7 @@ fn restore_with_imports_and_failures(
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'_>,
     resume_agents_on_restore: bool,
+    ime_control_enabled: bool,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
@@ -276,6 +286,7 @@ fn restore_with_imports_and_failures(
         let runtime_context = RestoreRuntimeContext {
             scrollback_limit_bytes,
             shell_config,
+            ime_control_enabled,
             resume_agents_on_restore,
             events: events.clone(),
             render_notify: render_notify.clone(),
@@ -418,6 +429,7 @@ fn restore_workspace(
             cached_git_ahead_behind: None,
             cached_git_space,
             worktree_space,
+            ime_control_enabled: runtime_context.ime_control_enabled,
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             metadata_token_sequences: HashMap::new(),
             public_pane_numbers,
@@ -519,13 +531,18 @@ fn restore_tab(
             .map(String::as_str);
         let launch_env = public_pane_id
             .map(|pane_id| {
-                PaneLaunchEnv::from_extra(Vec::new()).with_identity(
-                    workspace_id.to_string(),
-                    crate::workspace::public_tab_id_for_number(workspace_id, number),
-                    pane_id.to_string(),
-                )
+                PaneLaunchEnv::from_extra(Vec::new())
+                    .with_identity(
+                        workspace_id.to_string(),
+                        crate::workspace::public_tab_id_for_number(workspace_id, number),
+                        pane_id.to_string(),
+                    )
+                    .with_input_intent(runtime_context.ime_control_enabled)
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                PaneLaunchEnv::from_extra(Vec::new())
+                    .with_input_intent(runtime_context.ime_control_enabled)
+            });
         let imported_runtime = old_pane_id.and_then(|old_id| imported_panes.remove(&old_id));
         let was_imported = imported_runtime.is_some();
         let pending_native_agent_restore = if was_imported {
@@ -1223,6 +1240,7 @@ mod tests {
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
             false,
+            false,
             events,
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
@@ -1315,6 +1333,7 @@ mod tests {
             0,
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
+            false,
             false,
             events,
             Arc::new(Notify::new()),
@@ -1422,6 +1441,7 @@ mod tests {
             0,
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
+            false,
             false,
             events,
             Arc::new(Notify::new()),
@@ -1534,6 +1554,7 @@ mod tests {
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
             true,
+            false,
             events,
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
@@ -1561,6 +1582,7 @@ mod tests {
             0,
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
+            false,
             &mut imports,
             mpsc::channel(4).0,
             Arc::new(Notify::new()),
@@ -1596,6 +1618,7 @@ mod tests {
             4096,
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
+            false,
             false,
             events,
             render_notify,
@@ -1634,6 +1657,7 @@ mod tests {
             4096,
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
+            false,
             false,
             events,
             render_notify,

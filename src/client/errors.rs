@@ -16,6 +16,13 @@ pub enum ClientError {
     ConnectionLost(io::Error),
     /// Protocol error (framing, deserialization).
     Protocol(protocol::FramingError),
+    /// Enabled local IME control requires an explicitly advertised endpoint capability.
+    InputIntentUnsupported,
+    /// The endpoint did not provide a complete current input-intent replacement.
+    InputIntentProtocolError,
+    ImeControl(super::ime_control::ImeError),
+    ImeInputOverflow,
+    ImeAckTimeout,
 }
 
 impl std::fmt::Display for ClientError {
@@ -70,6 +77,17 @@ impl std::fmt::Display for ClientError {
                 }
             }
             ClientError::Protocol(err) => write!(f, "protocol error: {err}"),
+            ClientError::ImeControl(error) => write!(f, "{error}"),
+            ClientError::ImeInputOverflow => write!(f, "IME_INPUT_OVERFLOW: waiting input exceeded 256 batches or 2 MiB"),
+            ClientError::ImeAckTimeout => write!(f, "IME_ACK_TIMEOUT: input was not authorized within five seconds"),
+            ClientError::InputIntentUnsupported => write!(
+                f,
+                "IME_INTENT_UNSUPPORTED: endpoint does not support pane input intents"
+            ),
+            ClientError::InputIntentProtocolError => write!(
+                f,
+                "IME_INTENT_PROTOCOL_ERROR: endpoint has no complete current input-intent roster"
+            ),
         }
     }
 }
@@ -80,6 +98,7 @@ impl std::error::Error for ClientError {
             ClientError::ConnectionFailed(err) => Some(err),
             ClientError::ConnectionLost(err) => Some(err),
             ClientError::Protocol(err) => Some(err),
+            ClientError::ImeControl(error) => Some(error),
             _ => None,
         }
     }

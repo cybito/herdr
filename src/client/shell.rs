@@ -17,6 +17,10 @@ pub(super) use endpoints::*;
 mod global_menu;
 mod graphics;
 mod input;
+mod ime;
+pub(super) use ime::ImeGate;
+#[cfg(any(unix, test))]
+pub(super) use input::pixel_mouse_events;
 mod input_source;
 mod mobile;
 mod mouse;
@@ -85,11 +89,11 @@ fn delete_overlay_word(rename: &mut ClientRenameOverlay) {
 
 fn target_event_message(target: ClientInputTarget, event: ClientPaneInputEvent) -> ClientMessage {
     match target {
-        ClientInputTarget::Pane(pane_id) => ClientMessage::ClientShellPaneInput {
+        ClientInputTarget::Pane(pane_id) | ClientInputTarget::BoundPane { pane_id, .. } => ClientMessage::ClientShellPaneInput {
             pane_id,
             events: vec![event],
         },
-        ClientInputTarget::Popup(terminal_id) => ClientMessage::ClientShellPopupInput {
+        ClientInputTarget::Popup(terminal_id) | ClientInputTarget::BoundPopup { terminal_id, .. } => ClientMessage::ClientShellPopupInput {
             terminal_id,
             events: vec![event],
         },
@@ -102,6 +106,12 @@ fn push_target_event(
     outcome: &mut ClientShellInput,
 ) {
     match target {
+        ClientInputTarget::BoundPane { route, pane_id } => {
+            outcome.routed_requests.push((route, target_event_message(ClientInputTarget::Pane(pane_id), event)));
+        }
+        ClientInputTarget::BoundPopup { route, terminal_id } => {
+            outcome.routed_requests.push((route, target_event_message(ClientInputTarget::Popup(terminal_id), event)));
+        }
         ClientInputTarget::Pane(pane_id) => {
             if let Some(ClientMessage::ClientShellPaneInput {
                 pane_id: pending_pane,

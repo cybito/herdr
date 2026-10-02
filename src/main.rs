@@ -408,6 +408,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # allow_nested = false
 # Save recent pane screen history across full server restarts.
 pane_history = false
+# 应用报告 pane/Popup 的 command/text 意图，聚焦 client 通过本机 ime-control
+# 管理暂态英文；server/client 都须显式启用，默认关闭。text 不强制中文。
+# ime_control = false
 # While prefix mode is active, temporarily switch the host input source to
 # an ASCII-capable mode so prefix commands register even when an IME is
 # active, then restore the previous input source when prefix mode exits. On

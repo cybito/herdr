@@ -200,6 +200,7 @@ pub struct Workspace {
     pub public_pane_numbers: HashMap<PaneId, usize>,
     pub(crate) next_public_pane_number: usize,
     pub(crate) next_public_tab_number: usize,
+    pub(crate) ime_control_enabled: bool,
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
     #[cfg(test)]
@@ -266,42 +267,19 @@ impl Workspace {
             next_public_pane_number: 2,
             next_public_tab_number: 2,
             tabs: vec![tab],
+            ime_control_enabled: false,
             active_tab: 0,
             #[cfg(test)]
             test_runtimes: HashMap::new(),
         }
     }
 
-    pub fn new(
-        initial_cwd: PathBuf,
-        rows: u16,
-        cols: u16,
-        scrollback_limit_bytes: usize,
-        host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
-        shell_config: crate::pane::PaneShellConfig<'_>,
-        events: mpsc::Sender<AppEvent>,
-        render_notify: Arc<Notify>,
-        render_dirty: Arc<RenderSignal>,
-    ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
-        Self::new_with_tab(
-            initial_cwd,
-            rows,
-            cols,
-            scrollback_limit_bytes,
-            host_terminal_theme,
-            host_terminal_appearance,
-            shell_config,
-            events,
-            render_notify,
-            render_dirty,
-            None,
-            Vec::new(),
-        )
+    pub(crate) fn set_input_intent_enabled(&mut self, enabled: bool) {
+        self.ime_control_enabled = enabled;
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_extra_env(
+    pub(crate) fn new_with_extra_env(
         initial_cwd: PathBuf,
         rows: u16,
         cols: u16,
@@ -313,21 +291,8 @@ impl Workspace {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
         extra_env: Vec<(String, String)>,
+        ime_control_enabled: bool,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
-        if extra_env.is_empty() {
-            return Self::new(
-                initial_cwd,
-                rows,
-                cols,
-                scrollback_limit_bytes,
-                host_terminal_theme,
-                host_terminal_appearance,
-                shell_config,
-                events,
-                render_notify,
-                render_dirty,
-            );
-        }
         Self::new_with_tab(
             initial_cwd,
             rows,
@@ -341,6 +306,7 @@ impl Workspace {
             render_dirty,
             None,
             extra_env,
+            ime_control_enabled,
         )
     }
 
@@ -358,13 +324,16 @@ impl Workspace {
         render_dirty: Arc<RenderSignal>,
         argv: Option<&[String]>,
         extra_env: Vec<(String, String)>,
+        ime_control_enabled: bool,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         let id = generate_workspace_id();
-        let launch_env = PaneLaunchEnv::from_extra(extra_env).with_identity(
-            id.clone(),
-            public_tab_id_for_number(&id, 1),
-            public_pane_id_for_number(&id, 1),
-        );
+        let launch_env = PaneLaunchEnv::from_extra(extra_env)
+            .with_identity(
+                id.clone(),
+                public_tab_id_for_number(&id, 1),
+                public_pane_id_for_number(&id, 1),
+            )
+            .with_input_intent(ime_control_enabled);
         let (tab, terminal, runtime) = if let Some(argv) = argv {
             Tab::new_argv_command(
                 1,
@@ -418,6 +387,7 @@ impl Workspace {
                 next_public_pane_number: 2,
                 next_public_tab_number: 2,
                 tabs: vec![tab],
+                ime_control_enabled,
                 active_tab: 0,
                 #[cfg(test)]
                 test_runtimes: HashMap::new(),
@@ -986,11 +956,13 @@ impl Workspace {
         pane_number: usize,
         extra_env: Vec<(String, String)>,
     ) -> PaneLaunchEnv {
-        PaneLaunchEnv::from_extra(extra_env).with_identity(
-            self.id.clone(),
-            public_tab_id_for_number(&self.id, tab_number),
-            public_pane_id_for_number(&self.id, pane_number),
-        )
+        PaneLaunchEnv::from_extra(extra_env)
+            .with_identity(
+                self.id.clone(),
+                public_tab_id_for_number(&self.id, tab_number),
+                public_pane_id_for_number(&self.id, pane_number),
+            )
+            .with_input_intent(self.ime_control_enabled)
     }
 
     pub fn public_tab_number(&self, tab_idx: usize) -> Option<usize> {
@@ -1211,6 +1183,7 @@ impl Workspace {
             next_public_pane_number: 2,
             next_public_tab_number: 2,
             tabs: vec![tab],
+            ime_control_enabled: false,
             active_tab: 0,
             test_runtimes: HashMap::new(),
         }

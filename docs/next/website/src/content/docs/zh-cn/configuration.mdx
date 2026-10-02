@@ -557,6 +557,23 @@ switch_ascii_input_source_in_prefix = true
 目前 Windows 上的支持仅限于韩语 IME。使用其他语言的 IME 时，此设置不会改变输入源。
 :::
 
+## Pane 输入意图与本机 lease（实验）
+
+此定制源码默认关闭该路径。server 与 client 必须同时显式配置：
+
+```toml
+[experimental]
+ime_control = true
+```
+
+应用通过既有 Unix API 的 `pane.input_intent.stream` 报告自身 `command`/`text` 与生命周期。pane 使用 `HERDR_PANE_ID`，Popup 使用唯一 `HERDR_IME_POPUP_TERMINAL_ID`；`HERDR_IME_INTENT=1` 与 `HERDR_ENV=1` 先于 SSH/图形会话判断选择此 transport。缺失或矛盾 identity 明确失败，不猜 focused pane，也不使用 server 主机输入法。无 marker 时应用保留原有本地／SSH 行为。
+
+server 的 `scope:recorded` ACK 只表示意图已保存。聚焦 client 将该意图映射到本机 `ime-control` lease；命令输入等待匹配当前 endpoint、terminal/app generation 与 focus episode 的 `scope:applied` ACK。text 只释放暂态英文，不强制选择中文。失焦、应用退出、terminal 关闭、断开／重连或 endpoint 切换时释放；无 reporter 的 shell 与 Popup 不借用其他 pane 的输入源。native 父程序在 child 返回或 SIGCONT 后保持 inactive，下一个真实 key/FocusIn 才按当前模式恢复。
+
+client FIFO 门禁限 256 batches、2MiB、5s；失败明确拒绝，已发送按键的 release 仍走原 route，不等待新 ACK。网络收到意图前或外层 IME 已消费的首字符无法由此保护。Linux client 还要求独立、可信的 Hyprland foreground observer，不能用 daemon 存活或 reporter 的 FocusLost 代替真实图形焦点。
+
+开启该路径时 prefix 使用同一 daemon，不同时运行旧 `switch_ascii_input_source_in_prefix` direct-switch；关闭时旧行为不变。private bincode protocol 为 23，endpoint generation 仍为 1，能力另行协商；不支持的背景 endpoint 进入 Attention，不影响健康 Local。该候选尚未替换已安装程序；隔离 PTY/模拟 compositor 验证不等于真实 GUI 输入法验收。
+
 ## 环境变量
 
 | 变量 | 用途 |

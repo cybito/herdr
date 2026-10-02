@@ -26,6 +26,7 @@ mod events;
 mod frame_output;
 mod handshake;
 mod input;
+mod ime_control;
 mod loop_config;
 mod notifications;
 mod shell;
@@ -181,6 +182,7 @@ fn run_client_with_mode(
         mouse_capture_active: mouse_capture,
         endpoint_keybindings,
         remote_image_paste_key,
+        ime_control_enabled: loaded_config.config.experimental.ime_control,
         shell_config,
     };
 
@@ -234,13 +236,14 @@ fn run_client_with_mode(
                 true,
             )
             .map_err(|error| io::Error::other(error.to_string()))?;
-            if federated
-                && !endpoint::EndpointNegotiation::new(
-                    handshake.endpoint_methods.clone().unwrap_or_default(),
-                    handshake.endpoint_capabilities.clone().unwrap_or_default(),
-                )
-                .supports_surface_interest()
-            {
+            let negotiation = endpoint::EndpointNegotiation::new(
+                handshake.endpoint_methods.clone().unwrap_or_default(),
+                handshake.endpoint_capabilities.clone().unwrap_or_default(),
+            );
+            negotiation
+                .require_pane_input_intent(loop_config.ime_control_enabled)
+                .map_err(io::Error::other)?;
+            if federated && !negotiation.supports_surface_interest() {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "Local needs a server update before it can participate in multi-machine viewing",
@@ -260,7 +263,15 @@ fn run_client_with_mode(
         .transpose();
     let initial = match initial {
         Ok(initial) => initial,
-        Err(error) if federated => {
+        Err(error)
+            if federated
+                && !error.get_ref().is_some_and(|cause| {
+                    matches!(
+                        cause.downcast_ref::<ClientError>(),
+                        Some(ClientError::InputIntentUnsupported)
+                    )
+                }) =>
+        {
             warn!(%error, "Local handshake failed; keeping saved machines available");
             None
         }
@@ -348,6 +359,98 @@ fn run_client_with_mode(
     Ok(())
 }
 
+#[cfg(unix)]
+#[derive(Default)]
+struct ClientEventScheduler {
+    drain_next: bool,
+    supervisor_first: bool,
+}
+
+#[cfg(unix)]
+impl ClientEventScheduler {
+    async fn next(
+        &mut self,
+        scheduled: &mut Option<ClientLoopEvent>,
+        ime_ready: bool,
+        timer_deadline: std::time::Instant,
+        events: &mut tokio::sync::mpsc::Receiver<ClientLoopEvent>,
+        supervisors: &mut tokio::sync::mpsc::Receiver<endpoint::EndpointSupervisorEvent>,
+    ) -> ClientLoopEvent {
+        let supervisor_first = self.supervisor_first;
+        let incoming = async {
+            // Alternate the channel priority too: sustained snapshots must not
+            // starve reconnect results, nor reconnects starve focus/completion.
+            if supervisor_first {
+                tokio::select! {
+                    biased;
+                    event = supervisors.recv() => event.map(ClientLoopEvent::EndpointSupervisor).unwrap_or(ClientLoopEvent::Timer),
+                    event = events.recv() => event.unwrap_or(ClientLoopEvent::Timer),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    event = events.recv() => event.unwrap_or(ClientLoopEvent::Timer),
+                    event = supervisors.recv() => event.map(ClientLoopEvent::EndpointSupervisor).unwrap_or(ClientLoopEvent::Timer),
+                }
+            }
+        };
+        let event = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
+            _ = std::future::ready(()), if scheduled.is_some() => scheduled.take().expect("checked scheduled event"),
+            _ = std::future::ready(()), if ime_ready && self.drain_next => ClientLoopEvent::ImeDrain,
+            event = incoming => event,
+            _ = std::future::ready(()), if ime_ready => ClientLoopEvent::ImeDrain,
+        };
+        match &event {
+            ClientLoopEvent::Timer => {}
+            ClientLoopEvent::ImeDrain => self.drain_next = false,
+            ClientLoopEvent::EndpointSupervisor(_) => {
+                self.drain_next = true;
+                self.supervisor_first = false;
+            }
+            _ => {
+                self.drain_next = true;
+                self.supervisor_first = true;
+            }
+        }
+        event
+    }
+}
+
+/// Reject only a selected endpoint; `Some` reports whether its active host effects must be cleared.
+fn reject_unsupported_ime_endpoint(
+    state: &mut ClientState,
+    endpoints: &mut endpoint::EndpointRegistry,
+    commands: &mut endpoint_commands::EndpointCommands,
+    supervisors: &mut endpoint::EndpointSupervisors,
+    pending: &mut Option<endpoint::PendingEndpointActivation>,
+    endpoint_id: &endpoint::ClientEndpointId,
+    ime_enabled: bool,
+    now: std::time::Instant,
+) -> Option<bool> {
+    let connection = endpoints.connection(endpoint_id)?;
+    let error = connection.negotiation.require_pane_input_intent(ime_enabled).err()?;
+    let generation = connection.generation;
+    warn!(endpoint = %endpoint_id.storage_key(), generation, %error, "endpoint input intent is unsupported");
+    let notice = (endpoints.active_id() != endpoint_id).then(|| {
+        state.shell.as_ref().map(|shell| format!("{}: {error}", shell.endpoint_label(endpoint_id)))
+    }).flatten();
+    let active = handle_endpoint_attention(
+        state, endpoints, commands, supervisors, pending, endpoint_id, generation, now,
+        error.to_string(),
+    );
+    if let Some(message) = notice {
+        if let Some(shell) = state.shell.as_mut() {
+            shell.receive_endpoint_unavailable(message);
+            if let Some(frame) = shell.compose(state.reported_size.0, state.reported_size.1) {
+                state.present_frame(frame);
+            }
+        }
+    }
+    Some(active)
+}
+
 /// The main client event loop.
 ///
 /// Uses a threaded architecture:
@@ -432,6 +535,13 @@ async fn run_client_loop(
 
     // Channel for events from the resize and server reader threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
+    let mut ime_gate = if config.ime_control_enabled {
+        let shell = state.shell.as_mut().ok_or(ClientError::InputIntentProtocolError)?;
+        shell.enable_ime_control();
+        Some(shell::ImeGate::start(event_tx.clone())?)
+    } else {
+        None
+    };
     let (supervisor_tx, mut supervisor_rx) =
         tokio::sync::mpsc::channel::<endpoint::EndpointSupervisorEvent>(64);
     // Keep Windows console draining independent of server-frame backpressure.
@@ -567,6 +677,8 @@ async fn run_client_loop(
 
     // Main event loop.
     let mut client_timer = timer::ClientLoopTimer::new();
+    #[cfg(unix)]
+    let mut event_scheduler = ClientEventScheduler::default();
     #[cfg(windows)]
     let mut stdin_open = true;
     while !should_quit.load(Ordering::Acquire) {
@@ -675,13 +787,27 @@ async fn run_client_loop(
                 &supervisor_tx,
             );
         }
+        if let (Some(gate), Some(shell)) = (ime_gate.as_mut(), state.shell.as_mut()) {
+            gate.synchronize(shell, &write_stream, pending_activation.is_some(), std::time::Instant::now())?;
+            if gate.take_repaint() {
+                if let Some(frame) = shell.compose(state.reported_size.0, state.reported_size.1) {
+                    state.present_frozen_chrome(frame);
+                }
+            }
+        }
         let timer_delay = state
             .shell
             .as_ref()
             .map_or(Duration::from_millis(100), |shell| {
                 shell.timer_delay(std::time::Instant::now())
             });
-        let timer_deadline = client_timer.deadline(std::time::Instant::now(), timer_delay);
+        let mut timer_deadline = client_timer.deadline(std::time::Instant::now(), timer_delay);
+        if let Some(gate) = ime_gate.as_ref() {
+            if let Some(deadline) = gate.deadline() {
+                timer_deadline = timer_deadline.min(deadline);
+            }
+        }
+        #[cfg(windows)]
         let immediate_event = scheduled_activation.take();
         #[cfg(windows)]
         let event = if let Some(event) = immediate_event {
@@ -701,22 +827,56 @@ async fn run_client_loop(
             }
         };
         #[cfg(unix)]
-        let event = if let Some(event) = immediate_event {
-            event
-        } else {
-            tokio::select! {
-                biased;
-                _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
-                ev = supervisor_rx.recv() => ev.map(ClientLoopEvent::EndpointSupervisor).unwrap_or(ClientLoopEvent::Timer),
-                ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-            }
-        };
+        let event = event_scheduler.next(
+            &mut scheduled_activation,
+            ime_gate.as_ref().is_some_and(shell::ImeGate::ready),
+            timer_deadline,
+            &mut event_rx,
+            &mut supervisor_rx,
+        ).await;
         let now = std::time::Instant::now();
         if let Some(shell) = state.shell.as_mut() {
             shell.tick_popup_pending(now);
         }
 
         match event {
+            ClientLoopEvent::ReplayMouse(replay) => {
+                if let Some(shell) = state.shell.as_mut() {
+                    let outcome = if let Some(gate) = ime_gate.as_mut() {
+                        gate.enqueue_replay(shell, &write_stream, replay, pending_activation.is_some(), now)?
+                    } else {
+                        shell.replay_mouse_events(replay.events)
+                    };
+                    let frame = outcome.repaint.then(|| shell.compose(state.reported_size.0, state.reported_size.1)).flatten();
+                    if finish_client_shell_input(
+                        &mut state, outcome, frame, &mut write_stream, &mut pending_activation,
+                        &mut endpoint_commands, &mut prefix_input_source, &event_tx,
+                    )? {
+                        return Ok(());
+                    }
+                }
+            }
+            ClientLoopEvent::ImeDrain => {
+                if let (Some(gate), Some(shell)) = (ime_gate.as_mut(), state.shell.as_mut()) {
+                    if let Some(outcome) = gate.dispatch(
+                        shell, &mut write_stream, is_remote_client, state.remote_image_paste_key,
+                        pending_activation.is_some(), now,
+                    )? {
+                        let frame = outcome.repaint.then(|| shell.compose(state.reported_size.0, state.reported_size.1)).flatten();
+                        if finish_client_shell_input(
+                            &mut state, outcome, frame, &mut write_stream, &mut pending_activation,
+                            &mut endpoint_commands, &mut prefix_input_source, &event_tx,
+                        )? {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            ClientLoopEvent::ImeControl(completion) => {
+                if let Some(gate) = ime_gate.as_mut() {
+                    gate.complete(completion)?;
+                }
+            }
             ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
@@ -726,12 +886,39 @@ async fn run_client_loop(
                     write_stream.active_surface_available(),
                 );
                 if state.shell.is_some() {
+                    let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
+                    if ime_gate.is_none() && events.iter().any(|event| {
+                        matches!(
+                            event,
+                            crate::raw_input::RawInputEvent::Key(_)
+                                | crate::raw_input::RawInputEvent::Text(_)
+                                | crate::raw_input::RawInputEvent::Paste(_)
+                                | crate::raw_input::RawInputEvent::Mouse(_)
+                        )
+                    }) {
+                        require_client_input_intents(
+                            state.shell.as_ref(),
+                            &write_stream,
+                            config.ime_control_enabled,
+                        )?;
+                    }
                     if will_query_host_cell_size {
-                        let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
                         if let Some((width_px, height_px)) = reported_cell_size_from_events(&events)
                         {
                             store_reported_cell_size(&reported_cell_size, width_px, height_px);
                         }
+                    }
+                    if let Some(gate) = ime_gate.as_mut() {
+                        let shell = state.shell.as_mut().expect("checked shell mode");
+                        let outcome = gate.enqueue(shell, &write_stream, data, events, None, pending_activation.is_some(), now)?;
+                        let frame = outcome.repaint.then(|| shell.compose(state.reported_size.0, state.reported_size.1)).flatten();
+                        if finish_client_shell_input(
+                            &mut state, outcome, frame, &mut write_stream, &mut pending_activation,
+                            &mut endpoint_commands, &mut prefix_input_source, &event_tx,
+                        )? {
+                            return Ok(());
+                        }
+                        continue;
                     }
                     let image_target = state
                         .shell
@@ -770,7 +957,7 @@ async fn run_client_loop(
                     }
                     let (outcome, frame) = {
                         let shell = state.shell.as_mut().expect("checked shell mode");
-                        let outcome = shell.handle_input_bytes(&data);
+                        let outcome = shell.handle_raw_events(events);
                         let frame = outcome
                             .repaint
                             .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
@@ -791,6 +978,11 @@ async fn run_client_loop(
                     }
                     continue;
                 }
+                require_client_input_intents(
+                    state.shell.as_ref(),
+                    &write_stream,
+                    config.ime_control_enabled,
+                )?;
                 let data = if let Some(attach_escape) = &mut state.attach_escape {
                     match attach_escape.filter_input(
                         data,
@@ -931,6 +1123,23 @@ async fn run_client_loop(
             }
             #[cfg(unix)]
             ClientLoopEvent::PixelMouse(data, geometry) => {
+                if let (Some(gate), Some(shell)) = (ime_gate.as_mut(), state.shell.as_mut()) {
+                    let Some((events, pixels)) = shell::pixel_mouse_events(&data, geometry) else { continue };
+                    let outcome = gate.enqueue(shell, &write_stream, data, events, Some(pixels), pending_activation.is_some(), now)?;
+                    let frame = outcome.repaint.then(|| shell.compose(state.reported_size.0, state.reported_size.1)).flatten();
+                    if finish_client_shell_input(
+                        &mut state, outcome, frame, &mut write_stream, &mut pending_activation,
+                        &mut endpoint_commands, &mut prefix_input_source, &event_tx,
+                    )? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                require_client_input_intents(
+                    state.shell.as_ref(),
+                    &write_stream,
+                    config.ime_control_enabled,
+                )?;
                 if state.shell.is_some() {
                     let (outcome, frame) = {
                         let shell = state.shell.as_mut().expect("checked shell mode");
@@ -987,6 +1196,21 @@ async fn run_client_loop(
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
+                if events.iter().any(|event| {
+                    matches!(
+                        event,
+                        crate::protocol::ClientInputEvent::Key { .. }
+                            | crate::protocol::ClientInputEvent::TextCommit(_)
+                            | crate::protocol::ClientInputEvent::Paste { .. }
+                            | crate::protocol::ClientInputEvent::Mouse { .. }
+                    )
+                }) {
+                    require_client_input_intents(
+                        state.shell.as_ref(),
+                        &write_stream,
+                        config.ime_control_enabled,
+                    )?;
+                }
                 let image_bridge_active = endpoint_accepts_local_images(
                     is_remote_client,
                     write_stream.active_id(),
@@ -1186,6 +1410,17 @@ async fn run_client_loop(
                 target,
                 force,
             } => {
+                if let Some(active) = reject_unsupported_ime_endpoint(
+                    &mut state, &mut write_stream, &mut endpoint_commands, &mut supervisors,
+                    &mut pending_activation, &endpoint_id, config.ime_control_enabled, now,
+                ) {
+                    if active {
+                        clear_endpoint_host_effects(
+                            &mut state, &host_mouse_capture_active, &host_sgr_pixels_active,
+                        );
+                    }
+                    continue;
+                }
                 if !endpoint_catalog.select_endpoint(&endpoint_id) {
                     continue;
                 }
@@ -1695,29 +1930,24 @@ async fn run_client_loop(
                                 }
                             }
                         } else {
-                            let (outcome, frame) = {
-                                let shell = state.shell.as_mut().expect("shell endpoint response");
-                                let mut outcome = shell.replay_mouse_events(replay_mouse);
-                                outcome.repaint |= repaint;
-                                let frame = outcome
-                                    .repaint
-                                    .then(|| {
-                                        shell.compose(state.reported_size.0, state.reported_size.1)
-                                    })
-                                    .flatten();
-                                (outcome, frame)
-                            };
-                            if finish_client_shell_input(
-                                &mut state,
-                                outcome,
-                                frame,
-                                &mut write_stream,
-                                &mut pending_activation,
-                                &mut endpoint_commands,
-                                &mut prefix_input_source,
-                                &event_tx,
-                            )? {
-                                return Ok(());
+                            for replay in replay_mouse {
+                                if ime_gate.is_some() {
+                                    queue_mouse_replay(&event_tx, replay)?;
+                                } else {
+                                    let (outcome, frame) = {
+                                        let shell = state.shell.as_mut().expect("shell endpoint response");
+                                        let mut outcome = shell.replay_mouse_events(replay.events);
+                                        outcome.repaint |= repaint;
+                                        let frame = outcome.repaint.then(|| shell.compose(state.reported_size.0, state.reported_size.1)).flatten();
+                                        (outcome, frame)
+                                    };
+                                    if finish_client_shell_input(
+                                        &mut state, outcome, frame, &mut write_stream, &mut pending_activation,
+                                        &mut endpoint_commands, &mut prefix_input_source, &event_tx,
+                                    )? {
+                                        return Ok(());
+                                    }
+                                }
                             }
                         }
                     }
@@ -1859,6 +2089,22 @@ async fn run_client_loop(
                                 )));
                             }
                         };
+                        if let Some(connection) = write_stream.connection(&endpoint_id) {
+                            if let Some(shell) = state.shell.as_ref() {
+                                if !shell.validate_endpoint_input_intents(
+                                    &endpoint_id,
+                                    generation,
+                                    &snapshot,
+                                    &connection.negotiation,
+                                )? {
+                                    continue;
+                                }
+                            } else if connection.negotiation.supports_pane_input_intent()
+                                && snapshot.input_intents.is_none()
+                            {
+                                return Err(ClientError::InputIntentProtocolError);
+                            }
+                        }
                         let projection_pending = activation_message;
                         let activation_progress = activation_message
                             .then(|| {
@@ -2008,7 +2254,11 @@ async fn run_client_loop(
                         .collect::<Vec<_>>();
                     let (effects, outcome, frame) = {
                         let shell = state.shell.as_mut().expect("checked shell mode");
-                        let mut outcome = shell.tick_selection_autoscroll(now);
+                        let mut outcome = if ime_gate.as_ref().is_none_or(shell::ImeGate::authorized) {
+                            shell.tick_selection_autoscroll(now)
+                        } else {
+                            shell::ClientShellInput::default()
+                        };
                         for expired in expired_endpoints {
                             if !shell.endpoint_is_active(&expired.endpoint_id) {
                                 continue;

@@ -116,8 +116,7 @@ impl App {
                 .record_pane_focus_change(previous_focus, ws_idx, new_pane.pane_id);
             self.state.mode = crate::app::Mode::Terminal;
         }
-        self.terminal_runtimes
-            .insert(new_pane.terminal.id.clone(), new_pane.runtime);
+        self.install_terminal_runtime(new_pane.terminal.id.clone(), new_pane.runtime);
         self.state
             .remove_alias_shadowed_by_new_pane(new_pane.pane_id);
         self.state
@@ -1228,7 +1227,7 @@ impl App {
                     .map(|terminal| terminal.cwd.clone())
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
                 let moved_pane_id = moved.pane_id;
-                let workspace = crate::workspace::Workspace::from_existing_pane(
+                let mut workspace = crate::workspace::Workspace::from_existing_pane(
                     label,
                     tab_label,
                     identity_cwd,
@@ -1237,6 +1236,7 @@ impl App {
                     self.render_notify.clone(),
                     self.render_dirty.clone(),
                 );
+                workspace.set_input_intent_enabled(self.ime_control_enabled);
                 self.state.workspaces.push(workspace);
                 let target_ws_idx = self.state.workspaces.len() - 1;
                 created_workspace = true;
@@ -1366,6 +1366,7 @@ impl App {
                 self.render_notify.clone(),
                 self.render_dirty.clone(),
             );
+            workspace.set_input_intent_enabled(self.ime_control_enabled);
             workspace.id = context.previous_workspace_id;
             workspace.worktree_space = context.previous_worktree_space;
             let insert_idx = context.source_ws_idx.min(self.state.workspaces.len());

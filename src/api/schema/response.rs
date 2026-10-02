@@ -302,6 +302,10 @@ pub enum ResponseResult {
         projection_revision: u64,
     },
     Ok {},
+    PaneInputIntentStreamOpened {
+        session: String,
+        generation: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

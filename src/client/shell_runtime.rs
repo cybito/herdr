@@ -7,7 +7,7 @@ pub(super) fn dispatch_client_shell_actions(
     mut shell: Option<&mut shell::ClientShellState>,
     detached_process_children: &mut Vec<std::process::Child>,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
-) -> Result<(Vec<crossterm::event::MouseEvent>, bool), ClientError> {
+) -> Result<(Vec<shell::ClientMouseReplay>, bool), ClientError> {
     let mut replay_mouse = Vec::new();
     let mut repaint = false;
     for action in actions {
@@ -47,7 +47,7 @@ pub(super) fn dispatch_client_shell_actions(
                     }
                 }
             }
-            shell::ClientShellAction::ReplayMouse(events) => replay_mouse.extend(events),
+            shell::ClientShellAction::ReplayMouse(replay) => replay_mouse.push(replay),
             shell::ClientShellAction::Keybind(action) => {
                 debug!(
                     ?action,
@@ -70,6 +70,17 @@ pub(super) fn dispatch_client_shell_actions(
     }
     Ok((replay_mouse, repaint))
 }
+
+pub(super) fn queue_mouse_replay(
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    replay: shell::ClientMouseReplay,
+) -> Result<(), ClientError> {
+    event_tx.try_send(ClientLoopEvent::ReplayMouse(replay)).map_err(|error| match error {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => ClientError::ImeInputOverflow,
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => ClientError::ConnectionLost(io::Error::new(io::ErrorKind::BrokenPipe, "client input loop closed")),
+    })
+}
+
 
 pub(super) fn client_shell_resize_message(
     shell: &shell::ClientShellState,
@@ -545,6 +556,24 @@ pub(super) fn handle_endpoint_attention(
     endpoint_was_active
 }
 
+pub(super) fn require_client_input_intents(
+    shell: Option<&shell::ClientShellState>,
+    endpoints: &endpoint::EndpointRegistry,
+    enabled: bool,
+) -> Result<(), ClientError> {
+    if !enabled {
+        return Ok(());
+    }
+    let endpoint_id = endpoints.active_id();
+    let connection = endpoints
+        .connection(endpoint_id)
+        .ok_or(ClientError::InputIntentUnsupported)?;
+    connection.negotiation.require_pane_input_intent(true)?;
+    shell
+        .ok_or(ClientError::InputIntentProtocolError)?
+        .require_endpoint_input_intents(endpoint_id, connection.generation)
+}
+
 pub(super) fn install_client_shell_snapshot(
     state: &mut ClientState,
     endpoint_id: &endpoint::ClientEndpointId,
@@ -611,6 +640,25 @@ pub(super) fn install_client_shell_snapshot(
     Ok(())
 }
 
+/// Forward through the route captured by the existing key/mouse lease. Source
+/// focus/arbitration epochs deliberately do not apply to a balancing release.
+pub(super) fn send_bound_input(
+    shell: Option<&shell::ClientShellState>,
+    endpoints: &mut endpoint::EndpointRegistry,
+    route: &shell::ClientInputRoute,
+    request: &ClientMessage,
+) {
+    let current = endpoints.connection(&route.endpoint_id).is_some_and(|connection| {
+        connection.generation == route.connection_generation
+    }) && shell.is_some_and(|shell| {
+        shell.endpoint_route_boot_matches(&route.endpoint_id, &route.boot_id)
+            && shell.input_route_target_matches(route, request)
+    });
+    if current {
+        endpoints.send_to(&route.endpoint_id, request);
+    }
+}
+
 pub(super) fn finish_client_shell_input(
     state: &mut ClientState,
     outcome: shell::ClientShellInput,
@@ -668,10 +716,12 @@ pub(super) fn finish_client_shell_input(
     } else {
         frame
     };
-    debug_assert!(
-        replay.is_empty(),
-        "mouse replay only follows endpoint results"
-    );
+    for replay in replay {
+        queue_mouse_replay(event_tx, replay)?;
+    }
+    for (route, request) in outcome.routed_requests {
+        send_bound_input(state.shell.as_ref(), endpoints, &route, &request);
+    }
     let active_endpoint_online = state
         .shell
         .as_ref()

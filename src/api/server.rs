@@ -23,6 +23,7 @@ use crate::ipc::{
 };
 
 mod pane_graphics_stream;
+mod pane_input_intent_stream;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -168,7 +169,7 @@ fn handle_connection_with_stop(
     let Some(line) = read_initial_request_line(&mut stream)? else {
         return Ok(());
     };
-
+    let initial_line_len = line.len();
     let line = line.trim();
     if line.is_empty() {
         return Ok(());
@@ -177,16 +178,38 @@ fn handle_connection_with_stop(
     let request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
         Err(request_error) => {
-            write_json_line_allow_disconnect(
-                &mut stream,
-                &ErrorResponse {
+            let input_intent_id =
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .filter(|value| {
+                        value.get("method").and_then(serde_json::Value::as_str)
+                            == Some("pane.input_intent.stream")
+                    })
+                    .map(|value| {
+                        value
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned()
+                    });
+            let error = if let Some(id) = input_intent_id {
+                ErrorResponse {
+                    id,
+                    error: ErrorBody {
+                        code: "INVALID_REQUEST".into(),
+                        message: "invalid input intent stream request".into(),
+                    },
+                }
+            } else {
+                ErrorResponse {
                     id: String::new(),
                     error: ErrorBody {
                         code: "invalid_request".into(),
                         message: format!("invalid request: {request_error}"),
                     },
-                },
-            )?;
+                }
+            };
+            write_json_line_allow_disconnect(&mut stream, &error)?;
             return Ok(());
         }
     };
@@ -200,6 +223,40 @@ fn handle_connection_with_stop(
         Method::PaneGraphicsStream(params) => {
             let result =
                 pane_graphics_stream::serve(stream, request_id.clone(), params, api_tx, running);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    "stream_closed",
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
+        }
+        Method::PaneInputIntentStream(params) => {
+            if initial_line_len > pane_input_intent_stream::MAX_FRAME_BYTES {
+                return write_json_line_allow_disconnect(
+                    &mut stream,
+                    &ErrorResponse {
+                        id: request_id,
+                        error: ErrorBody {
+                            code: "INVALID_REQUEST".into(),
+                            message: "stream open frame is too large".into(),
+                        },
+                    },
+                );
+            }
+            let result = pane_input_intent_stream::serve(
+                stream,
+                request_id.clone(),
+                params,
+                api_tx,
+                running,
+                server_stop,
+            );
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
                     &request_id,
@@ -467,6 +524,10 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneGraphicsStreamDirect(_) => "pane.graphics.stream.direct",
         Method::PaneGraphicsStreamOpen(_) => "pane.graphics.stream.open",
         Method::PaneGraphicsStreamClose(_) => "pane.graphics.stream.close",
+        Method::PaneInputIntentStream(_) => "pane.input_intent.stream",
+        Method::PaneInputIntentStreamOpen(_) => "pane.input_intent.stream.open",
+        Method::PaneInputIntentStreamOperation(_) => "pane.input_intent.stream.operation",
+        Method::PaneInputIntentStreamClose(_) => "pane.input_intent.stream.close",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
         Method::PaneReportMetadata(_) => "pane.report_metadata",

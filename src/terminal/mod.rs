@@ -1,3 +1,6 @@
+mod input_intent;
+
+pub(crate) use input_intent::{InputIntentError, InputIntentStore};
 mod history_read;
 mod id;
 mod runtime;

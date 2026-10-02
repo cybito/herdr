@@ -710,6 +710,7 @@ impl ClientShellState {
                 pane_id,
                 inner_rect,
                 fallback_events,
+                ime_origin,
             } => {
                 let completed_before_release = !fallback_events.iter().any(|event| {
                     event.kind
@@ -728,7 +729,7 @@ impl ClientShellState {
                 }
                 let replay_action = |events: Option<Vec<crossterm::event::MouseEvent>>| {
                     events
-                        .map(ClientShellAction::ReplayMouse)
+                        .map(|events| ClientShellAction::ReplayMouse(ClientMouseReplay { events, origin: ime_origin }))
                         .into_iter()
                         .collect()
                 };

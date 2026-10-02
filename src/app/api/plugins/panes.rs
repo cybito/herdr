@@ -283,8 +283,7 @@ impl App {
         let mut terminal = new_pane.terminal;
         terminal.set_manual_label(pane_manifest.title.clone());
         let terminal_id = terminal.id.clone();
-        self.terminal_runtimes
-            .insert(terminal_id.clone(), new_pane.runtime);
+        self.install_terminal_runtime(terminal_id.clone(), new_pane.runtime);
         self.state
             .remove_alias_shadowed_by_new_pane(new_pane.pane_id);
         self.state.terminals.insert(terminal_id, terminal);

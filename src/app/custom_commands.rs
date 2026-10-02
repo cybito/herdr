@@ -342,8 +342,7 @@ impl App {
             }
         };
         let terminal_id = new_pane.terminal.id.clone();
-        self.terminal_runtimes
-            .insert(terminal_id.clone(), new_pane.runtime);
+        self.install_terminal_runtime(terminal_id.clone(), new_pane.runtime);
         self.state
             .remove_alias_shadowed_by_new_pane(new_pane.pane_id);
         self.state.terminals.insert(terminal_id, new_pane.terminal);
@@ -403,11 +402,6 @@ impl App {
             self.state.host_terminal_appearance,
         )?;
         let new_pane_id = new_pane.pane_id;
-        self.terminal_runtimes
-            .insert(new_pane.terminal.id.clone(), new_pane.runtime);
-        self.state
-            .terminals
-            .insert(new_pane.terminal.id.clone(), new_pane.terminal);
         let new_focus_target = crate::app::state::PaneFocusTarget {
             workspace_id: ws.id.clone(),
             pane_id: new_pane_id,
@@ -422,6 +416,10 @@ impl App {
         ws.active_tab_mut()
             .expect("workspace must have an active tab")
             .zoomed = true;
+        self.install_terminal_runtime(new_pane.terminal.id.clone(), new_pane.runtime);
+        self.state
+            .terminals
+            .insert(new_pane.terminal.id.clone(), new_pane.terminal);
         self.overlay_panes.insert(
             new_pane_id,
             super::OverlayPaneState {

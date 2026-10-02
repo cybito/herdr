@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocol": 22,
+  "protocol": 23,
   "schema_version": 1,
   "schemas": {
     "error_response": {
@@ -2694,6 +2694,24 @@
             "image_width",
             "image_height"
           ],
+          "type": "object"
+        },
+        "PaneInputIntentStreamParams": {
+          "additionalProperties": false,
+          "properties": {
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "popup_terminal_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
           "type": "object"
         },
         "PaneInputSetParams": {
@@ -5987,6 +6005,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.input_intent.stream",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneInputIntentStreamParams"
             }
           },
           "required": [
@@ -10518,6 +10552,28 @@
               },
               "required": [
                 "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "generation": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "session": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_input_intent_stream_opened",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "session",
+                "generation"
               ],
               "type": "object"
             }

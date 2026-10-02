@@ -136,7 +136,10 @@ impl App {
         let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
         let pane_id = PaneId::alloc();
         let terminal_id = TerminalId::alloc();
-        let launch_env = PaneLaunchEnv::from_extra(extra_env).without_pane_identity();
+        let launch_env = PaneLaunchEnv::from_extra(extra_env)
+            .with_popup_input_intent(terminal_id.to_string())
+            .without_pane_identity()
+            .with_input_intent(self.ime_control_enabled);
         let terminal_area = if self.state.view.terminal_area.width >= 4
             && self.state.view.terminal_area.height >= 4
         {
@@ -157,7 +160,7 @@ impl App {
             Some(argv) => TerminalState::new(terminal_id.clone(), cwd).with_launch_argv(argv),
             None => TerminalState::new(terminal_id.clone(), cwd),
         };
-        self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        self.install_terminal_runtime(terminal_id.clone(), runtime);
         self.state.terminals.insert(terminal_id.clone(), terminal);
         self.state.popup_pane = Some(crate::app::state::PopupPaneState {
             pane_id,

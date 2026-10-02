@@ -46,6 +46,20 @@ impl EndpointNegotiation {
         self.capabilities.contains(capability)
     }
 
+    pub(crate) fn supports_pane_input_intent(&self) -> bool {
+        self.supports_capability(crate::protocol::endpoint::PANE_INPUT_INTENT_CAPABILITY)
+    }
+
+    pub(crate) fn require_pane_input_intent(
+        &self,
+        enabled: bool,
+    ) -> Result<(), crate::client::ClientError> {
+        if enabled && !self.supports_pane_input_intent() {
+            return Err(crate::client::ClientError::InputIntentUnsupported);
+        }
+        Ok(())
+    }
+
     pub(crate) fn supports_surface_interest(&self) -> bool {
         self.supports_capability(crate::protocol::endpoint::SURFACE_INTEREST_CAPABILITY)
             && self.supports_capability(

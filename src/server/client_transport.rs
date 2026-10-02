@@ -648,6 +648,7 @@ pub(crate) fn handle_client_handshake(
     client_id: u64,
     server_event_tx: &mpsc::Sender<ServerEvent>,
     should_quit: &Arc<AtomicBool>,
+    ime_control_enabled: bool,
 ) -> io::Result<()> {
     if should_quit.load(Ordering::Acquire) {
         return Ok(());
@@ -806,6 +807,7 @@ pub(crate) fn handle_client_handshake(
                 .iter()
                 .map(|method| (*method).to_owned())
                 .collect(),
+            ime_control_enabled && cfg!(unix),
         );
         ServerMessage::EndpointControl {
             kind: ENDPOINT_WELCOME_KIND.into(),
@@ -1729,13 +1731,47 @@ mod tests {
     }
 
     #[test]
+    fn private_protocol_22_client_is_rejected_before_attach() {
+        let (mut client_stream, server_stream, _path) = local_stream_pair("client-protocol-22");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn(move || {
+            handle_client_handshake(server_stream, 44, &server_event_tx, &should_quit, true)
+        });
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::TerminalHello {
+                version: 22,
+                cols: 80,
+                rows: 24,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                pixel_mouse: false,
+            },
+        )
+        .unwrap();
+        let welcome: ServerMessage =
+            protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).unwrap();
+        assert!(matches!(
+            welcome,
+            ServerMessage::Welcome {
+                version: 23,
+                error: Some(_),
+                ..
+            }
+        ));
+        handle.join().unwrap().unwrap();
+        assert!(server_event_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn handshake_negotiates_terminal_ansi_encoding() {
         let (mut client_stream, server_stream, _path) = local_stream_pair("client-handshake-ansi");
         let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
         let should_quit = Arc::new(AtomicBool::new(false));
         let handshake_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            handle_client_handshake(server_stream, 42, &server_event_tx, &handshake_quit)
+            handle_client_handshake(server_stream, 42, &server_event_tx, &handshake_quit, false)
         });
 
         protocol::write_message(
@@ -1803,7 +1839,7 @@ mod tests {
         let should_quit = Arc::new(AtomicBool::new(false));
         let handshake_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            handle_client_handshake(server_stream, 43, &server_event_tx, &handshake_quit)
+            handle_client_handshake(server_stream, 43, &server_event_tx, &handshake_quit, false)
         });
 
         protocol::write_message(&mut client_stream, &endpoint_hello(80, 29))
@@ -1860,7 +1896,7 @@ mod tests {
         let should_quit = Arc::new(AtomicBool::new(false));
         let handshake_quit = should_quit.clone();
         let handle = std::thread::spawn(move || {
-            handle_client_handshake(server_stream, 43, &server_event_tx, &handshake_quit)
+            handle_client_handshake(server_stream, 43, &server_event_tx, &handshake_quit, false)
         });
 
         protocol::write_message(&mut client_stream, &endpoint_hello(0, 29))

@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -939,6 +940,10 @@ pub struct ClientShellSnapshot {
     pub panes: Vec<ClientShellPane>,
     pub agents: Vec<ClientShellAgent>,
     pub commands: Vec<ClientShellCommand>,
+    /// Complete replacement roster of live pane and popup input-intent sessions.
+    /// Present (including an empty roster) only when pane input intent is supported.
+    #[serde(default)]
+    pub input_intents: Option<Arc<[crate::api::schema::TerminalInputIntents]>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1055,6 +1060,9 @@ pub struct ClientShellPane {
     pub foreground_cwd: Option<String>,
     pub focused: bool,
     pub right_click_passthrough: bool,
+    /// Actual runtime identity for pane input intents; absent on older endpoints.
+    #[serde(default)]
+    pub terminal_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2676,6 +2684,7 @@ mod tests {
                 foreground_cwd: Some("/repo".into()),
                 focused: true,
                 right_click_passthrough: false,
+                terminal_id: None,
             }],
             agents: Vec::new(),
             commands: vec![ClientShellCommand {
@@ -2685,11 +2694,40 @@ mod tests {
                 action: ClientShellCommandAction::Shell,
                 description: Some("deploy".into()),
             }],
+            input_intents: Some(
+                vec![crate::api::schema::TerminalInputIntents {
+                    terminal_id: "terminal-1".into(),
+                    sessions: vec![crate::api::schema::InputIntentSession {
+                        session: "reporter-1".into(),
+                        generation: 2,
+                        policy: crate::api::schema::InputIntentPolicy::Mode,
+                        state: crate::api::schema::InputIntentState::Command,
+                        active: true,
+                    }],
+                }]
+                .into(),
+            ),
         }));
-        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
-        let (decoded, _): (ServerMessage, _) =
-            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
-        assert_eq!(msg, decoded);
+        let ServerMessage::ClientShellSnapshot(snapshot) = &msg else {
+            unreachable!();
+        };
+        for input_intents in [
+            snapshot.input_intents.clone(),
+            Some(Vec::new().into()),
+            None,
+        ] {
+            let mut msg = msg.clone();
+            let ServerMessage::ClientShellSnapshot(snapshot) = &mut msg else {
+                unreachable!();
+            };
+            snapshot.panes[0].terminal_id =
+                input_intents.is_some().then(|| "terminal-1".to_owned());
+            snapshot.input_intents = input_intents;
+            let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+            let (decoded, _): (ServerMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(msg, decoded);
+        }
     }
 
     #[test]

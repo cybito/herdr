@@ -219,6 +219,7 @@ pub(super) struct PaneSplitHit {
 }
 
 pub(super) struct ClientPaneMouseGesture {
+    pub(super) route: Option<std::sync::Arc<ClientInputRoute>>,
     pub(super) hit: PaneHit,
     pub(super) button: crossterm::event::MouseButton,
     pub(super) stripped_modifiers: crossterm::event::KeyModifiers,
@@ -303,9 +304,23 @@ pub(crate) enum ClientShellAction {
         endpoint_id: ClientEndpointId,
         target: Option<ClientEndpointFocusTarget>,
     },
-    ReplayMouse(Vec<crossterm::event::MouseEvent>),
+    ReplayMouse(ClientMouseReplay),
     Keybind(crate::input::KeybindAction),
 }
+
+#[derive(Clone, Debug)]
+pub(in crate::client) struct ClientReplayOrigin {
+    pub(in crate::client) route: std::sync::Arc<ClientInputRoute>,
+    pub(in crate::client) authorization: std::sync::Arc<crate::client::ime_control::AuthorizationKey>,
+    pub(in crate::client) deadline: std::time::Instant,
+}
+
+#[derive(Debug)]
+pub(crate) struct ClientMouseReplay {
+    pub(in crate::client) events: Vec<crossterm::event::MouseEvent>,
+    pub(in crate::client) origin: Option<ClientReplayOrigin>,
+}
+
 
 #[derive(Default)]
 pub(crate) struct ClientShellInput {
@@ -315,6 +330,7 @@ pub(crate) struct ClientShellInput {
     pub query_host_appearance: bool,
     pub query_host_theme: bool,
     pub requests: Vec<ClientMessage>,
+    pub(in crate::client) routed_requests: Vec<(std::sync::Arc<ClientInputRoute>, ClientMessage)>,
     pub actions: Vec<ClientShellAction>,
 }
 
@@ -703,6 +719,7 @@ pub(super) enum PendingEndpointKind {
         pane_id: String,
         inner_rect: Rect,
         fallback_events: Vec<crossterm::event::MouseEvent>,
+        ime_origin: Option<ClientReplayOrigin>,
     },
     CopyMotion {
         pane_id: String,
@@ -787,6 +804,22 @@ pub(super) struct ClientVisibleNotification {
 pub(super) enum ClientInputTarget {
     Pane(String),
     Popup(String),
+    BoundPane {
+        route: std::sync::Arc<ClientInputRoute>,
+        pane_id: String,
+    },
+    BoundPopup {
+        route: std::sync::Arc<ClientInputRoute>,
+        terminal_id: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::client) struct ClientInputRoute {
+    pub(in crate::client) endpoint_id: ClientEndpointId,
+    pub(in crate::client) connection_generation: u64,
+    pub(in crate::client) boot_id: std::sync::Arc<str>,
+    pub(in crate::client) terminal_target: Option<std::sync::Arc<str>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -952,6 +985,11 @@ pub(crate) struct ClientShellState {
     pub(super) copy_feedback_deadline: Option<std::time::Instant>,
     pub(super) host_mouse_pixels: Option<crate::input::mouse::HostPixels>,
     pub(super) input_leases: ClientInputLeases,
+    pub(super) ime_control_enabled: bool,
+    pub(super) input_route: Option<std::sync::Arc<ClientInputRoute>>,
+    pub(super) ime_forward_prefix: bool,
+    pub(super) ime_authorization: Option<std::sync::Arc<crate::client::ime_control::AuthorizationKey>>,
+    pub(super) ime_input_deadline: Option<std::time::Instant>,
     pub(super) popup_pending: bool,
     pub(super) popup_pending_deadline: Option<std::time::Instant>,
     pub(super) next_request_id: u64,
@@ -1095,6 +1133,11 @@ impl ClientShellState {
             copy_feedback_deadline: None,
             host_mouse_pixels: None,
             input_leases: ClientInputLeases::default(),
+            ime_control_enabled: false,
+            input_route: None,
+            ime_forward_prefix: false,
+            ime_authorization: None,
+            ime_input_deadline: None,
             popup_pending: false,
             popup_pending_deadline: None,
             next_request_id: 1,
@@ -1193,7 +1236,9 @@ impl ClientShellState {
         self.hits = ShellHitMap::default();
         self.pane_surface = None;
         self.pending_pane_surface = None;
-        self.input_leases = ClientInputLeases::default();
+        if !self.ime_control_enabled {
+            self.input_leases = ClientInputLeases::default();
+        }
         self.popup_terminal_id = None;
         self.chrome_drag = None;
         self.workspace_press = None;
@@ -1224,7 +1269,9 @@ impl ClientShellState {
             .startup_onboarding
             .then_some(ClientShellOverlay::Onboarding);
         self.previous_pane_id = None;
-        self.pane_mouse_gesture = None;
+        if !self.ime_control_enabled {
+            self.pane_mouse_gesture = None;
+        }
         self.url_click_consumes_until_up = false;
         self.replaying_url_click = false;
         self.selection = None;
@@ -1590,9 +1637,10 @@ impl ClientShellState {
             {
                 self.cancel_settings_overlay();
             }
-            if let Some(terminal_id) = previous_popup.as_ref() {
-                self.input_leases
-                    .remove_target(&ClientInputTarget::Popup(terminal_id.clone()));
+            if !self.ime_control_enabled {
+                if let Some(terminal_id) = previous_popup.as_ref() {
+                    self.input_leases.remove_target(&ClientInputTarget::Popup(terminal_id.clone()));
+                }
             }
             self.mode = ClientShellMode::Terminal;
             self.navigate_workspace_id = None;
@@ -1616,7 +1664,7 @@ impl ClientShellState {
             self.chrome_drag = None;
             self.workspace_press = None;
             self.tab_press = None;
-            if self.pane_mouse_gesture.as_ref().is_some_and(|gesture| {
+            if !self.ime_control_enabled && self.pane_mouse_gesture.as_ref().is_some_and(|gesture| {
                 gesture.hit.popup && previous_popup.as_deref() == Some(gesture.hit.pane_id.as_str())
             }) {
                 self.pane_mouse_gesture = None;

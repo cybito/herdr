@@ -4,6 +4,172 @@ use crate::client::endpoint::{
 };
 use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 
+struct InputIntentTestTransport;
+
+impl crate::client::endpoint::EndpointTransport for InputIntentTestTransport {
+    fn send(&mut self, _message: &ClientMessage) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn input_intent_negotiation() -> crate::client::endpoint::EndpointNegotiation {
+    crate::client::endpoint::EndpointNegotiation::new(
+        Vec::new(),
+        vec![crate::protocol::endpoint::PANE_INPUT_INTENT_CAPABILITY.into()],
+    )
+}
+
+fn input_intent_registry(
+    negotiation: crate::client::endpoint::EndpointNegotiation,
+    generation: u64,
+) -> crate::client::endpoint::EndpointRegistry {
+    crate::client::endpoint::EndpointRegistry::new(
+        InputIntentTestTransport,
+        generation,
+        negotiation,
+    )
+}
+
+#[test]
+fn enabled_input_rejects_an_unadvertised_endpoint_before_dispatch() {
+    let (mut state, _) = state_with_remote();
+    let registry = input_intent_registry(Default::default(), 1);
+    let input = crate::client::shell_runtime::require_client_input_intents(
+        Some(&state),
+        &registry,
+        true,
+    )
+    .map(|()| state.handle_input_bytes(b"x"));
+    assert!(matches!(
+        input,
+        Err(crate::client::ClientError::InputIntentUnsupported)
+    ));
+}
+
+#[test]
+fn advertised_missing_roster_is_rejected_but_stale_replacements_are_ignored() {
+    let (mut state, _) = state_with_remote();
+    let endpoint_id = ClientEndpointId::Local;
+    let negotiation = input_intent_negotiation();
+    let mut current = snapshot();
+    current.revision = 3;
+    current.input_intents = Some(std::sync::Arc::from([]));
+    state.set_endpoint_snapshot_for_generation(&endpoint_id, 1, Box::new(current));
+    let mut missing = snapshot();
+    missing.revision = 4;
+    assert!(matches!(
+        state.validate_endpoint_input_intents(&endpoint_id, 1, &missing, &negotiation),
+        Err(crate::client::ClientError::InputIntentProtocolError)
+    ));
+    missing.revision = 2;
+    assert!(!state
+        .validate_endpoint_input_intents(&endpoint_id, 1, &missing, &negotiation)
+        .unwrap());
+    assert_eq!(state.snapshot.as_ref().unwrap().revision, 3);
+    assert!(state.require_endpoint_input_intents(&endpoint_id, 1).is_ok());
+}
+
+#[test]
+fn complete_empty_roster_allows_input_without_a_reporter() {
+    let (mut state, _) = state_with_remote();
+    let endpoint_id = ClientEndpointId::Local;
+    let negotiation = input_intent_negotiation();
+    let mut replacement = snapshot();
+    replacement.input_intents = Some(std::sync::Arc::from([]));
+    assert!(state
+        .validate_endpoint_input_intents(&endpoint_id, 1, &replacement, &negotiation)
+        .unwrap());
+    state.set_endpoint_snapshot_for_generation(&endpoint_id, 1, Box::new(replacement));
+    let registry = input_intent_registry(negotiation, 1);
+    crate::client::shell_runtime::require_client_input_intents(Some(&state), &registry, true)
+        .unwrap();
+    let input = state.handle_input_bytes(b"x");
+    assert!(matches!(
+        input.requests.as_slice(),
+        [ClientMessage::ClientShellPaneInput { pane_id, .. }] if pane_id == "pane_1"
+    ));
+}
+
+#[test]
+fn old_json_snapshot_remains_usable_with_ime_disabled() {
+    let (mut state, _) = state_with_remote();
+    let mut json = serde_json::to_value(snapshot()).unwrap();
+    json.as_object_mut().unwrap().remove("input_intents");
+    let old: ClientShellSnapshot = serde_json::from_value(json).unwrap();
+    let negotiation = crate::client::endpoint::EndpointNegotiation::default();
+    assert!(state
+        .validate_endpoint_input_intents(&ClientEndpointId::Local, 1, &old, &negotiation)
+        .unwrap());
+    state.set_endpoint_snapshot_for_generation(&ClientEndpointId::Local, 1, Box::new(old));
+    let registry = input_intent_registry(negotiation, 1);
+    crate::client::shell_runtime::require_client_input_intents(Some(&state), &registry, false)
+        .unwrap();
+    let input = state.handle_input_bytes(b"x");
+    assert!(matches!(
+        input.requests.as_slice(),
+        [ClientMessage::ClientShellPaneInput { pane_id, .. }] if pane_id == "pane_1"
+    ));
+}
+
+#[test]
+fn reconnect_and_new_boot_never_admit_input_using_the_old_roster() {
+    let (mut state, _) = state_with_remote();
+    let endpoint_id = ClientEndpointId::Local;
+    let negotiation = input_intent_negotiation();
+    let mut previous = snapshot();
+    previous.revision = 9;
+    previous.input_intents = Some(std::sync::Arc::from([
+        crate::api::schema::TerminalInputIntents {
+            terminal_id: "terminal-old".into(),
+            sessions: vec![crate::api::schema::InputIntentSession {
+                session: "reporter-old".into(),
+                generation: 3,
+                policy: crate::api::schema::InputIntentPolicy::Mode,
+                state: crate::api::schema::InputIntentState::Command,
+                active: true,
+            }],
+        },
+    ]));
+    state.set_endpoint_snapshot_for_generation(&endpoint_id, 1, Box::new(previous));
+    let registry = input_intent_registry(negotiation.clone(), 2);
+    assert!(matches!(
+        crate::client::shell_runtime::require_client_input_intents(Some(&state), &registry, true),
+        Err(crate::client::ClientError::InputIntentProtocolError)
+    ));
+    let mut replacement = snapshot();
+    replacement.boot_id = "new-boot".into();
+    replacement.input_intents = Some(std::sync::Arc::from([]));
+    assert!(state
+        .validate_endpoint_input_intents(&endpoint_id, 2, &replacement, &negotiation)
+        .unwrap());
+    state.cache_endpoint_snapshot_inactive_for_generation(
+        &endpoint_id,
+        2,
+        Box::new(replacement),
+    );
+    assert!(matches!(
+        crate::client::shell_runtime::require_client_input_intents(Some(&state), &registry, true),
+        Err(crate::client::ClientError::InputIntentProtocolError)
+    ));
+    assert!(state.activate_endpoint_projection(&endpoint_id));
+    crate::client::shell_runtime::require_client_input_intents(Some(&state), &registry, true)
+        .unwrap();
+    assert_eq!(state.snapshot.as_ref().unwrap().boot_id, "new-boot");
+    assert!(state
+        .snapshot
+        .as_ref()
+        .unwrap()
+        .input_intents
+        .as_ref()
+        .unwrap()
+        .is_empty());
+    let downgraded = input_intent_registry(Default::default(), 3);
+    assert!(matches!(
+        crate::client::shell_runtime::require_client_input_intents(Some(&state), &downgraded, true),
+        Err(crate::client::ClientError::InputIntentUnsupported)
+    ));
+}
+
 fn remote_profile() -> SavedSshEndpoint {
     SavedSshEndpoint {
         id: ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),

@@ -444,6 +444,76 @@ pub struct PaneGraphicsStreamParams {
     pub owner: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum InputIntentState {
+    Command,
+    Text,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum InputIntentPolicy {
+    Mode,
+    Entry,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct InputIntentSession {
+    pub session: String,
+    pub generation: u64,
+    pub policy: InputIntentPolicy,
+    pub state: InputIntentState,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalInputIntents {
+    pub terminal_id: String,
+    pub sessions: Vec<InputIntentSession>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaneInputIntentStreamParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub popup_terminal_id: Option<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub owner: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
+pub enum InputIntentOperation {
+    Enter {},
+    Activate {
+        state: InputIntentState,
+        policy: InputIntentPolicy,
+    },
+    State {
+        state: InputIntentState,
+    },
+    Blur {},
+    Suspend {},
+    Resume {
+        state: InputIntentState,
+    },
+    Close {},
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneInputIntentStreamOperationParams {
+    pub session: String,
+    pub operation: InputIntentOperation,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneReportAgentParams {
     pub pane_id: String,
