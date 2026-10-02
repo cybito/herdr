@@ -198,7 +198,9 @@ impl ImeGate {
             let Some(connection) = endpoints.connection(&endpoint.endpoint_id) else { continue };
             let Some(snapshot) = endpoint.snapshot.as_deref().filter(|_| endpoint.snapshot_generation == Some(connection.generation)) else { continue };
             if let Err(error) = connection.negotiation.require_pane_input_intent(true) {
-                if &endpoint.endpoint_id == endpoints.active_id() { return Err(error) }
+                // A disconnected/frozen surface has no input route. Release first;
+                // require the capability again once that surface is actually usable.
+                if &endpoint.endpoint_id == endpoints.active_id() && endpoints.active_surface_available() { return Err(error) }
                 continue;
             }
             let roster = snapshot.input_intents.as_ref().ok_or(ClientError::InputIntentProtocolError)?;
@@ -763,6 +765,30 @@ mod tests {
             let target = registry.active_id().clone();
             registry.send_to(&target, &request);
         }
+    }
+
+    #[test]
+    fn unavailable_surface_releases_before_rechecking_capability() {
+        let (mut gate, mut shell, mut registry, messages) = fixture(Some(InputIntentState::Command));
+        let now = Instant::now();
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+        applied(&mut gate);
+        let old_authorization = gate.authorization.as_ref().unwrap().clone();
+        let snapshot = shell.snapshot.as_ref().unwrap().as_ref().clone();
+        let (sender, _receiver) = mpsc::channel();
+        registry.insert(ClientEndpointId::Local, RecordingTransport(sender), 2, EndpointNegotiation::default(), false);
+        registry.freeze_input();
+        shell.set_endpoint_snapshot_for_generation(&ClientEndpointId::Local, 2, Box::new(snapshot));
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+        assert!(gate.pending_plan.as_ref().unwrap().desired.is_none());
+        assert!(gate.pending_plan.as_ref().unwrap().live_leases.is_empty());
+        assert!(!gate.applied);
+        gate.complete(Completion { authorization: old_authorization, result: Ok(AckScope::Applied) }).unwrap();
+        assert!(!gate.applied);
+        assert!(matches!(messages.try_recv(), Err(mpsc::TryRecvError::Disconnected) | Err(mpsc::TryRecvError::Empty)));
+        registry.set_surface_active(&ClientEndpointId::Local, true);
+        registry.unfreeze_input();
+        assert!(matches!(gate.synchronize(&mut shell, &registry, false, now), Err(ClientError::InputIntentUnsupported)));
     }
 
     #[test]
