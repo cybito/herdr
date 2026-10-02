@@ -1709,6 +1709,11 @@ mod tests {
             framer.set_host_escape_disambiguation_active(true);
             let mut chunks = framer.push(bytes);
             chunks.extend(framer.flush_timeout());
+            // Confirmed host input first waits for a possible mouse tail; the
+            // following idle expiry releases a bare Escape without that tail.
+            if framer.has_pending_input() {
+                chunks.extend(framer.flush_timeout());
+            }
             for chunk in chunks {
                 let events = crate::raw_input::parse_raw_input_bytes_sync(&chunk);
                 gate.enqueue(&mut shell, &registry, chunk, events, None, false, now)
