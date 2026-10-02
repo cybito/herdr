@@ -4,9 +4,8 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::api::schema::{
-    InputIntentOperation, Method,
-    PaneInputIntentStreamOperationParams, PaneInputIntentStreamParams, Request, ResponseResult,
-    TerminalInputIntents,
+    InputIntentOperation, Method, PaneInputIntentStreamOperationParams,
+    PaneInputIntentStreamParams, Request, ResponseResult, TerminalInputIntents,
 };
 use crate::terminal::{InputIntentError, TerminalId};
 
@@ -58,22 +57,22 @@ impl App {
         }
 
         match &request.method {
-            Method::PaneInputIntentStreamOpen(_) => Some(
-                crate::app::api::responses::encode_error(
-                    request.id.clone(),
-                    "request_cancelled",
-                    "input intent stream request was cancelled before it started",
+            Method::PaneInputIntentStreamOpen(_) => Some(crate::app::api::responses::encode_error(
+                request.id.clone(),
+                "request_cancelled",
+                "input intent stream request was cancelled before it started",
+            )),
+            Method::PaneInputIntentStreamOperation(params) => Some(
+                self.operation_ack(
+                    false,
+                    self.input_intents
+                        .generation_for(&params.session)
+                        .unwrap_or(0),
+                    &params.session,
+                    None,
+                    Some("TIMEOUT"),
                 ),
             ),
-            Method::PaneInputIntentStreamOperation(params) => Some(self.operation_ack(
-                false,
-                self.input_intents
-                    .generation_for(&params.session)
-                    .unwrap_or(0),
-                &params.session,
-                None,
-                Some("TIMEOUT"),
-            )),
             _ => None,
         }
     }
@@ -129,10 +128,7 @@ impl App {
                 "input intent stream request was cancelled before it started",
             );
         }
-        let update = match self
-            .input_intents
-            .open(terminal_id, params.owner.clone())
-        {
+        let update = match self.input_intents.open(terminal_id, params.owner.clone()) {
             Ok(update) => update,
             Err(InputIntentError::InvalidRequest) => {
                 return crate::app::api::responses::encode_error(
@@ -240,8 +236,7 @@ impl App {
             error,
         })
         .unwrap_or_else(|_| {
-            r#"{"ok":false,"generation":0,"session":"","error":"INVALID_REQUEST"}"#
-                .to_owned()
+            r#"{"ok":false,"generation":0,"session":"","error":"INVALID_REQUEST"}"#.to_owned()
         })
     }
 
@@ -318,9 +313,9 @@ mod tests {
         PaneMoveParams, Request, SuccessResponse,
     };
     use crate::app::{App, AppPolicy};
-    use ratatui::layout::Direction;
     use crate::terminal::{TerminalId, TerminalRuntime, TerminalState};
     use crate::workspace::Workspace;
+    use ratatui::layout::Direction;
 
     fn app_with_pane_target() -> (App, String, TerminalId) {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -381,10 +376,8 @@ mod tests {
     #[tokio::test]
     async fn stream_open_binds_pane_alias_to_real_terminal_and_caches_roster() {
         let (mut app, pane_alias, terminal_id) = app_with_pane_target();
-        let success = open_success(&app.handle_api_request(open_pane_request(
-            pane_alias,
-            "pane-reporter",
-        )));
+        let success =
+            open_success(&app.handle_api_request(open_pane_request(pane_alias, "pane-reporter")));
         let crate::api::schema::ResponseResult::PaneInputIntentStreamOpened {
             session,
             generation,
@@ -426,9 +419,8 @@ mod tests {
             crate::api::EventHub::default(),
         );
         app.ime_control_enabled = true;
-        let (_, popup_id) = app.install_test_popup_runtime(TerminalRuntime::test_with_screen_bytes(
-            80, 24, b"",
-        ));
+        let (_, popup_id) =
+            app.install_test_popup_runtime(TerminalRuntime::test_with_screen_bytes(80, 24, b""));
         let wrong_id = TerminalId::alloc().to_string();
         let wrong = app.handle_api_request(Request {
             id: "wrong-popup".into(),
@@ -451,7 +443,10 @@ mod tests {
             }),
         });
         let opened = open_success(&opened);
-        assert_eq!(app.terminal_input_intents()[0].terminal_id, popup_id.to_string());
+        assert_eq!(
+            app.terminal_input_intents()[0].terminal_id,
+            popup_id.to_string()
+        );
         assert!(matches!(
             opened.result,
             crate::api::schema::ResponseResult::PaneInputIntentStreamOpened { .. }
@@ -473,7 +468,10 @@ mod tests {
         let mut workspace = Workspace::test_new("moving");
         let retained_pane = workspace.test_split(Direction::Horizontal);
         let terminal_id = workspace.terminal_id(retained_pane).unwrap().clone();
-        let original_root_id = workspace.terminal_id(workspace.tabs[0].root_pane).unwrap().clone();
+        let original_root_id = workspace
+            .terminal_id(workspace.tabs[0].root_pane)
+            .unwrap()
+            .clone();
         app.state.workspaces.push(workspace);
         for id in [terminal_id.clone(), original_root_id.clone()] {
             app.state.terminals.insert(
@@ -486,10 +484,9 @@ mod tests {
             TerminalRuntime::test_with_screen_bytes(80, 24, b""),
         );
         let pane_alias = app.public_pane_id(0, retained_pane).unwrap();
-        open_success(&app.handle_api_request(open_pane_request(
-            pane_alias.clone(),
-            "moving-reporter",
-        )));
+        open_success(
+            &app.handle_api_request(open_pane_request(pane_alias.clone(), "moving-reporter")),
+        );
 
         let response = app.handle_api_request(Request {
             id: "move-pane".into(),
@@ -507,8 +504,14 @@ mod tests {
             moved.result,
             crate::api::schema::ResponseResult::PaneMove { .. }
         ));
-        assert_eq!(app.terminal_input_intents()[0].terminal_id, terminal_id.to_string());
-        assert_eq!(app.state.workspaces[1].terminal_id(retained_pane), Some(&terminal_id));
+        assert_eq!(
+            app.terminal_input_intents()[0].terminal_id,
+            terminal_id.to_string()
+        );
+        assert_eq!(
+            app.state.workspaces[1].terminal_id(retained_pane),
+            Some(&terminal_id)
+        );
     }
 
     #[cfg(unix)]
@@ -525,10 +528,7 @@ mod tests {
         assert_eq!(response["error"]["code"], "request_cancelled");
         assert!(Arc::ptr_eq(&before_open, &app.terminal_input_intents()));
 
-        open_success(&app.handle_api_request(open_pane_request(
-            pane_alias,
-            "live-reporter",
-        )));
+        open_success(&app.handle_api_request(open_pane_request(pane_alias, "live-reporter")));
         let before_operation = app.terminal_input_intents();
         let canceled_operation = Arc::new(AtomicBool::new(false));
         let response = app.handle_api_request_after_internal_events_drained_with_active(
@@ -544,24 +544,27 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["ok"], false);
         assert_eq!(response["error"], "TIMEOUT");
-        assert!(Arc::ptr_eq(&before_operation, &app.terminal_input_intents()));
+        assert!(Arc::ptr_eq(
+            &before_operation,
+            &app.terminal_input_intents()
+        ));
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn replacing_runtime_for_same_terminal_retires_its_reporters() {
         let (mut app, pane_alias, terminal_id) = app_with_pane_target();
-        open_success(&app.handle_api_request(open_pane_request(
-            pane_alias,
-            "replace-reporter",
-        )));
+        open_success(&app.handle_api_request(open_pane_request(pane_alias, "replace-reporter")));
         let response = app.handle_api_request(operation_request(
             "replace-reporter",
             InputIntentOperation::Enter {},
         ));
         let ack: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(ack["scope"], "recorded");
-        assert_eq!(app.input_intents.owner_for(&terminal_id), Some("replace-reporter"));
+        assert_eq!(
+            app.input_intents.owner_for(&terminal_id),
+            Some("replace-reporter")
+        );
 
         app.install_terminal_runtime(
             terminal_id,
@@ -583,10 +586,7 @@ mod tests {
     #[tokio::test]
     async fn input_intent_open_and_operation_have_recorded_raw_ack_contract() {
         let (mut app, pane_alias, _) = app_with_pane_target();
-        open_success(&app.handle_api_request(open_pane_request(
-            pane_alias,
-            "ack-reporter",
-        )));
+        open_success(&app.handle_api_request(open_pane_request(pane_alias, "ack-reporter")));
         let response = app.handle_api_request(operation_request(
             "ack-reporter",
             InputIntentOperation::Activate {

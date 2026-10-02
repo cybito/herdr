@@ -9,8 +9,8 @@ use crate::api::schema::{
     PaneInputIntentStreamOperationParams, PaneInputIntentStreamParams, Request, ResponseResult,
     SuccessResponse,
 };
-use crate::terminal::{TerminalRuntime, TerminalState};
 use crate::protocol::ClientMessage;
+use crate::terminal::{TerminalRuntime, TerminalState};
 use crate::workspace::Workspace;
 
 #[tokio::test]
@@ -49,7 +49,11 @@ async fn canceled_stream_requests_do_not_reach_the_intent_store() {
         stream_active: Some(Arc::clone(&active)),
     });
     let opened: SuccessResponse = serde_json::from_str(&response_rx.recv().unwrap()).unwrap();
-    let ResponseResult::PaneInputIntentStreamOpened { session, generation } = opened.result else {
+    let ResponseResult::PaneInputIntentStreamOpened {
+        session,
+        generation,
+    } = opened.result
+    else {
         panic!("expected input intent stream open result");
     };
     assert_eq!(session, "reporter");
@@ -145,11 +149,28 @@ async fn pane_input_intent_negotiation_uses_the_server_setting_and_an_explicit_e
             enabled
         );
         let connected = server.server_event_rx.recv().await.unwrap();
-        assert!(matches!(&connected, ServerEvent::ClientShellConnected { .. }));
+        assert!(matches!(
+            &connected,
+            ServerEvent::ClientShellConnected { .. }
+        ));
         assert!(server.handle_server_event(connected));
-        let snapshot = client_shell_snapshot(
-            protocol::read_message(&mut client, MAX_FRAME_SIZE).unwrap(),
-        );
+        let completions: ServerMessage =
+            protocol::read_message(&mut client, MAX_FRAME_SIZE).unwrap();
+        let ServerMessage::EndpointControl { kind, data } = completions else {
+            panic!("expected endpoint agent completions");
+        };
+        assert_eq!(kind, crate::protocol::endpoint::AGENT_COMPLETIONS_KIND);
+        let completions: crate::protocol::endpoint::EndpointAgentCompletions =
+            serde_json::from_str(&data).unwrap();
+        let message: ServerMessage = protocol::read_message(&mut client, MAX_FRAME_SIZE).unwrap();
+        let ServerMessage::EndpointControl { kind, data } = message else {
+            panic!("expected endpoint snapshot");
+        };
+        assert_eq!(kind, crate::protocol::endpoint::ENDPOINT_SNAPSHOT_KIND);
+        let snapshot: Box<crate::protocol::ClientShellSnapshot> =
+            serde_json::from_str(&data).unwrap();
+        assert_eq!(completions.boot_id, snapshot.boot_id);
+        assert_eq!(completions.revision, snapshot.revision);
         if enabled {
             assert_eq!(snapshot.input_intents.as_deref(), Some(&[][..]));
         } else {
@@ -202,7 +223,10 @@ fn install_intent_workspace(
 #[cfg(unix)]
 fn open_reporter(server: &mut HeadlessServer, params: PaneInputIntentStreamParams) {
     let response = intent_request(server, Method::PaneInputIntentStreamOpen(params));
-    assert_eq!(response["result"]["type"], "pane_input_intent_stream_opened");
+    assert_eq!(
+        response["result"]["type"],
+        "pane_input_intent_stream_opened"
+    );
 }
 
 #[cfg(unix)]
@@ -221,16 +245,7 @@ fn update_reporter(server: &mut HeadlessServer, session: &str, operation: InputI
 fn recv_intent_snapshot(
     receiver: &std::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Box<crate::protocol::ClientShellSnapshot> {
-    loop {
-        let message = read_server_message(receiver.recv_timeout(Duration::from_secs(2)).unwrap());
-        if matches!(
-            &message,
-            ServerMessage::EndpointControl { kind, .. }
-                if kind == crate::protocol::endpoint::ENDPOINT_SNAPSHOT_KIND
-        ) {
-            return client_shell_snapshot(message);
-        }
-    }
+    client_shell_snapshot(receiver)
 }
 
 #[cfg(unix)]
@@ -280,7 +295,13 @@ async fn replacement_roster_includes_hidden_workspace_and_popup_sessions_for_eve
     let roster = first.input_intents.as_deref().unwrap();
     assert_eq!(roster.len(), 3);
     for (terminal, session, generation, state, active) in [
-        (&visible_terminal, "visible", 2, InputIntentState::Command, true),
+        (
+            &visible_terminal,
+            "visible",
+            2,
+            InputIntentState::Command,
+            true,
+        ),
         (&hidden_terminal, "hidden", 3, InputIntentState::Text, false),
         (&popup_terminal, "popup", 2, InputIntentState::Command, true),
     ] {
@@ -351,10 +372,19 @@ async fn suspended_parent_eof_replaces_roster_without_changing_the_active_child(
     assert!(!Arc::ptr_eq(&initial_empty, &parent_cache));
     assert!(Arc::ptr_eq(
         &parent_cache,
-        server.clients[&73].shell_snapshot.as_ref().unwrap().input_intents.as_ref().unwrap()
+        server.clients[&73]
+            .shell_snapshot
+            .as_ref()
+            .unwrap()
+            .input_intents
+            .as_ref()
+            .unwrap()
     ));
     server.render_and_stream();
-    assert!(Arc::ptr_eq(&parent_cache, &server.app.terminal_input_intents()));
+    assert!(Arc::ptr_eq(
+        &parent_cache,
+        &server.app.terminal_input_intents()
+    ));
 
     update_reporter(&mut server, "parent", InputIntentOperation::Suspend {});
     server.render_and_stream();
@@ -418,7 +448,10 @@ async fn suspended_parent_eof_replaces_roster_without_changing_the_active_child(
         parent_eof.input_intents.as_ref().unwrap()[0].sessions,
         vec![expected_child]
     );
-    assert!(!Arc::ptr_eq(&child_cache, &server.app.terminal_input_intents()));
+    assert!(!Arc::ptr_eq(
+        &child_cache,
+        &server.app.terminal_input_intents()
+    ));
 
     update_reporter(&mut server, "child", InputIntentOperation::Close {});
     server.render_and_stream();
@@ -428,10 +461,19 @@ async fn suspended_parent_eof_replaces_roster_without_changing_the_active_child(
     let empty_cache = server.app.terminal_input_intents();
     update_reporter(&mut server, "child", InputIntentOperation::Close {});
     server.render_and_stream();
-    assert!(Arc::ptr_eq(&empty_cache, &server.app.terminal_input_intents()));
     assert!(Arc::ptr_eq(
         &empty_cache,
-        server.clients[&73].shell_snapshot.as_ref().unwrap().input_intents.as_ref().unwrap()
+        &server.app.terminal_input_intents()
+    ));
+    assert!(Arc::ptr_eq(
+        &empty_cache,
+        server.clients[&73]
+            .shell_snapshot
+            .as_ref()
+            .unwrap()
+            .input_intents
+            .as_ref()
+            .unwrap()
     ));
     shutdown_test_runtimes(&mut server);
 }
@@ -444,7 +486,8 @@ async fn moved_pane_keeps_its_reporter_identity_but_respawn_requires_a_new_repor
     let mut server = test_headless_server();
     server.app.ime_control_enabled = true;
     install_intent_workspace(&mut server, "moving");
-    let moved_pane = server.app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+    let moved_pane =
+        server.app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
     let terminal_id = server.app.state.workspaces[0]
         .terminal_id(moved_pane)
         .unwrap()
@@ -472,7 +515,11 @@ async fn moved_pane_keeps_its_reporter_identity_but_respawn_requires_a_new_repor
             owner: "before-respawn".into(),
         },
     );
-    update_reporter(&mut server, "before-respawn", InputIntentOperation::Enter {});
+    update_reporter(
+        &mut server,
+        "before-respawn",
+        InputIntentOperation::Enter {},
+    );
     let (control, _render) = connect_test_shell(&mut server, 74, 80, 24);
     let before_move = recv_intent_snapshot(&control);
     let before_cache = server.app.terminal_input_intents();
@@ -492,19 +539,28 @@ async fn moved_pane_keeps_its_reporter_identity_but_respawn_requires_a_new_repor
         panic!("expected successful pane move");
     };
     assert!(move_result.changed);
-    assert_ne!(move_result.pane.workspace_id, move_result.previous_workspace_id);
+    assert_ne!(
+        move_result.pane.workspace_id,
+        move_result.previous_workspace_id
+    );
     assert!(server.focus_shell_client_on_tab(74, &move_result.pane.tab_id));
     server.render_and_stream();
     let after_move = recv_intent_snapshot(&control);
     assert!(after_move.revision > before_move.revision);
     assert_eq!(after_move.input_intents, before_move.input_intents);
-    assert!(Arc::ptr_eq(&before_cache, &server.app.terminal_input_intents()));
+    assert!(Arc::ptr_eq(
+        &before_cache,
+        &server.app.terminal_input_intents()
+    ));
     let current_pane = after_move
         .panes
         .iter()
         .find(|pane| pane.pane_id == move_result.pane.pane_id)
         .unwrap();
-    assert_eq!(current_pane.terminal_id.as_deref(), Some(terminal_id.as_str()));
+    assert_eq!(
+        current_pane.terminal_id.as_deref(),
+        Some(terminal_id.as_str())
+    );
     let roster = after_move.input_intents.as_ref().unwrap();
     let matching = roster
         .iter()
@@ -522,10 +578,12 @@ async fn moved_pane_keeps_its_reporter_identity_but_respawn_requires_a_new_repor
         .get_mut(&terminal_id)
         .unwrap()
         .respawn_shell_on_exit = true;
-    server.app.handle_internal_event(crate::events::AppEvent::PaneDied {
-        pane_id: moved_pane,
-        exit_reason: crate::platform::ChildExitReason::Exited,
-    });
+    server
+        .app
+        .handle_internal_event(crate::events::AppEvent::PaneDied {
+            pane_id: moved_pane,
+            exit_reason: crate::platform::ChildExitReason::Exited,
+        });
     server.render_and_stream();
     let after_respawn = recv_intent_snapshot(&control);
     assert!(after_respawn.revision > after_move.revision);

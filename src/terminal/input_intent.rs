@@ -63,8 +63,7 @@ impl InputIntentStore {
         self.sessions
             .iter()
             .find(|session| {
-                session.terminal_id == *terminal_id
-                    && session.lifecycle == SessionLifecycle::Active
+                session.terminal_id == *terminal_id && session.lifecycle == SessionLifecycle::Active
             })
             .map(|session| session.session.as_str())
     }
@@ -285,7 +284,9 @@ fn valid_state(state: InputIntentState) -> bool {
 mod tests {
     use std::sync::Arc;
 
-    use crate::api::schema::{InputIntentOperation as Operation, InputIntentPolicy as Policy, InputIntentState as State};
+    use crate::api::schema::{
+        InputIntentOperation as Operation, InputIntentPolicy as Policy, InputIntentState as State,
+    };
     use crate::terminal::TerminalId;
 
     use super::InputIntentStore;
@@ -329,11 +330,22 @@ mod tests {
         activate_mode(&mut store, "child", State::Command);
         store.apply("child", &Operation::Close {}).unwrap();
 
-        assert_eq!(sessions_for(&store, &terminal_id), vec![("parent".into(), false)]);
+        assert_eq!(
+            sessions_for(&store, &terminal_id),
+            vec![("parent".into(), false)]
+        );
         store
-            .apply("parent", &Operation::Resume { state: State::Command })
+            .apply(
+                "parent",
+                &Operation::Resume {
+                    state: State::Command,
+                },
+            )
             .unwrap();
-        assert_eq!(sessions_for(&store, &terminal_id), vec![("parent".into(), true)]);
+        assert_eq!(
+            sessions_for(&store, &terminal_id),
+            vec![("parent".into(), true)]
+        );
     }
 
     #[test]
@@ -370,7 +382,10 @@ mod tests {
 
         store.apply("old", &Operation::Close {}).unwrap();
 
-        assert_eq!(sessions_for(&store, &terminal_id), vec![("new".into(), true)]);
+        assert_eq!(
+            sessions_for(&store, &terminal_id),
+            vec![("new".into(), true)]
+        );
         assert_eq!(store.owner_for(&terminal_id).as_deref(), Some("new"));
     }
 
@@ -413,7 +428,14 @@ mod tests {
 
         assert!(store.retire_terminal(&terminal_id));
         assert!(store.snapshot().is_empty());
-        assert!(store.apply("reporter", &Operation::Resume { state: State::Command }).is_err());
+        assert!(store
+            .apply(
+                "reporter",
+                &Operation::Resume {
+                    state: State::Command
+                }
+            )
+            .is_err());
         assert!(store.apply("reporter", &Operation::Close {}).is_ok());
         assert!(!store.retire_terminal(&terminal_id));
     }

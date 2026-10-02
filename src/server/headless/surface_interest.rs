@@ -57,7 +57,7 @@ impl HeadlessServer {
 
         if let Some(held_inputs) = held_inputs {
             self.release_client_shell_inputs(client_id, held_inputs);
-            self.retire_direct_graphics_for_client(client_id);
+            self.retire_native_graphics_for_client(client_id);
         }
         if changed {
             self.finish_shell_location_reconciliation(focus_before, &focused_tabs_before);
@@ -69,7 +69,20 @@ impl HeadlessServer {
             // explicitly requests the bounded replay after its coherent frame is visible.
             self.sent_window_title = None;
             self.resize_shared_runtime_to_effective_size_with_pending_agent_resumes(true);
-            self.claim_shell_tab_geometry(client_id, true);
+            let focused_viewer_already_owns_tab = self
+                .shell_tab_id_for_client(client_id)
+                .is_some_and(|tab_id| {
+                    self.clients.iter().any(|(&other_id, client)| {
+                        other_id != client_id
+                            && client.is_active_shell_client()
+                            && client.outer_terminal_focus == Some(true)
+                            && self.shell_tab_id_for_client(other_id).as_deref()
+                                == Some(tab_id.as_str())
+                    })
+                });
+            if !focused_viewer_already_owns_tab {
+                self.claim_shell_tab_geometry(client_id, true);
+            }
         } else {
             self.tab_geometry_controllers
                 .retain(|_, controller_id| *controller_id != client_id);

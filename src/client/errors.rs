@@ -9,9 +9,14 @@ pub enum ClientError {
     /// Could not connect to the server's client socket.
     ConnectionFailed(io::Error),
     /// Server rejected our handshake.
-    HandshakeRejected { version: u32, error: String },
+    HandshakeRejected {
+        version: u32,
+        error: String,
+    },
     /// Server shut down.
-    ServerShutdown { reason: Option<String> },
+    ServerShutdown {
+        reason: Option<String>,
+    },
     /// Lost connection to the server.
     ConnectionLost(io::Error),
     /// Protocol error (framing, deserialization).
@@ -78,8 +83,14 @@ impl std::fmt::Display for ClientError {
             }
             ClientError::Protocol(err) => write!(f, "protocol error: {err}"),
             ClientError::ImeControl(error) => write!(f, "{error}"),
-            ClientError::ImeInputOverflow => write!(f, "IME_INPUT_OVERFLOW: waiting input exceeded 256 batches or 2 MiB"),
-            ClientError::ImeAckTimeout => write!(f, "IME_ACK_TIMEOUT: input was not authorized within five seconds"),
+            ClientError::ImeInputOverflow => write!(
+                f,
+                "IME_INPUT_OVERFLOW: waiting input exceeded 256 batches or 2 MiB"
+            ),
+            ClientError::ImeAckTimeout => write!(
+                f,
+                "IME_ACK_TIMEOUT: input was not authorized within five seconds"
+            ),
             ClientError::InputIntentUnsupported => write!(
                 f,
                 "IME_INTENT_UNSUPPORTED: endpoint does not support pane input intents"

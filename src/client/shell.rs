@@ -3,6 +3,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 mod actions;
 mod agent_sidebar;
 mod aggregate_navigation;
+mod machine_diagnostics;
+mod workspace_navigation;
+use workspace_navigation::{PendingWorkspaceHighlight, WorkspaceNavigationTarget};
 mod composition;
 mod config;
 mod context_menu;
@@ -16,12 +19,13 @@ mod endpoints;
 pub(super) use endpoints::*;
 mod global_menu;
 mod graphics;
-mod input;
 mod ime;
+mod input;
 pub(super) use ime::ImeGate;
 #[cfg(any(unix, test))]
 pub(super) use input::pixel_mouse_events;
 mod input_source;
+mod link_hover;
 mod mobile;
 mod mouse;
 mod notification_policy;
@@ -33,7 +37,11 @@ mod scroll;
 mod settings;
 mod state;
 mod surface_patch;
+mod text_editor;
+mod word_selection;
 mod worktrees;
+use text_editor::TextEditor;
+use word_selection::ClientWordSelection;
 
 pub(in crate::client::shell) use render::sidebar;
 pub(crate) use state::*;
@@ -63,40 +71,21 @@ use crate::protocol::{
 #[cfg(test)]
 use crate::raw_input::RawInputEvent;
 
-fn delete_overlay_word(rename: &mut ClientRenameOverlay) {
-    if rename.replace_on_type {
-        rename.input.clear();
-        rename.replace_on_type = false;
-        return;
-    }
-    while rename.input.chars().last().is_some_and(char::is_whitespace) {
-        rename.input.pop();
-    }
-    let Some(word) = rename
-        .input
-        .chars()
-        .last()
-        .map(|character| character.is_alphanumeric() || character == '_')
-    else {
-        return;
-    };
-    while rename.input.chars().last().is_some_and(|character| {
-        !character.is_whitespace() && (character.is_alphanumeric() || character == '_') == word
-    }) {
-        rename.input.pop();
-    }
-}
-
 fn target_event_message(target: ClientInputTarget, event: ClientPaneInputEvent) -> ClientMessage {
     match target {
-        ClientInputTarget::Pane(pane_id) | ClientInputTarget::BoundPane { pane_id, .. } => ClientMessage::ClientShellPaneInput {
-            pane_id,
-            events: vec![event],
-        },
-        ClientInputTarget::Popup(terminal_id) | ClientInputTarget::BoundPopup { terminal_id, .. } => ClientMessage::ClientShellPopupInput {
-            terminal_id,
-            events: vec![event],
-        },
+        ClientInputTarget::Pane(pane_id) | ClientInputTarget::BoundPane { pane_id, .. } => {
+            ClientMessage::ClientShellPaneInput {
+                pane_id,
+                events: vec![event],
+            }
+        }
+        ClientInputTarget::Popup(terminal_id)
+        | ClientInputTarget::BoundPopup { terminal_id, .. } => {
+            ClientMessage::ClientShellPopupInput {
+                terminal_id,
+                events: vec![event],
+            }
+        }
     }
 }
 
@@ -107,10 +96,16 @@ fn push_target_event(
 ) {
     match target {
         ClientInputTarget::BoundPane { route, pane_id } => {
-            outcome.routed_requests.push((route, target_event_message(ClientInputTarget::Pane(pane_id), event)));
+            outcome.routed_requests.push((
+                route,
+                target_event_message(ClientInputTarget::Pane(pane_id), event),
+            ));
         }
         ClientInputTarget::BoundPopup { route, terminal_id } => {
-            outcome.routed_requests.push((route, target_event_message(ClientInputTarget::Popup(terminal_id), event)));
+            outcome.routed_requests.push((
+                route,
+                target_event_message(ClientInputTarget::Popup(terminal_id), event),
+            ));
         }
         ClientInputTarget::Pane(pane_id) => {
             if let Some(ClientMessage::ClientShellPaneInput {

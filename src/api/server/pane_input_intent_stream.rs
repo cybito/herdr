@@ -294,11 +294,13 @@ fn validate_open_response(
         {
             return Err(OpenResponseError::Invalid);
         }
-        let success =
-            serde_json::from_value::<SuccessResponse>(value).map_err(|_| OpenResponseError::Invalid)?;
+        let success = serde_json::from_value::<SuccessResponse>(value)
+            .map_err(|_| OpenResponseError::Invalid)?;
         return match success.result {
-            ResponseResult::PaneInputIntentStreamOpened { session, generation }
-                if session == owner && generation > 0 => Ok(Opened { generation }),
+            ResponseResult::PaneInputIntentStreamOpened {
+                session,
+                generation,
+            } if session == owner && generation > 0 => Ok(Opened { generation }),
             _ => Err(OpenResponseError::Invalid),
         };
     }
@@ -355,12 +357,10 @@ fn serve_operations(
         operation_number = operation_number.saturating_add(1);
         let operation_request = Request {
             id: format!("{request_id}:intent:{operation_number}"),
-            method: Method::PaneInputIntentStreamOperation(
-                PaneInputIntentStreamOperationParams {
-                    session: owner.to_owned(),
-                    operation,
-                },
-            ),
+            method: Method::PaneInputIntentStreamOperation(PaneInputIntentStreamOperationParams {
+                session: owner.to_owned(),
+                operation,
+            }),
         };
         let gate = Arc::new(AtomicBool::new(true));
         let deadline = started_at + request_timeout;
@@ -427,11 +427,18 @@ fn serve_operations(
         } else {
             ack.error.as_deref().unwrap_or("INVALID_REQUEST")
         };
-        tracing::debug!(request_id, operation = operation_name, generation, outcome, "input intent operation completed");
+        tracing::debug!(
+            request_id,
+            operation = operation_name,
+            generation,
+            outcome,
+            "input intent operation completed"
+        );
         if let Err(err) = write_text_line_allow_disconnect(stream, &response) {
             return Err(err);
         }
-        if matches!(operation_name, "close") || (!ack.ok && ack.error.as_deref() == Some("TIMEOUT")) {
+        if matches!(operation_name, "close") || (!ack.ok && ack.error.as_deref() == Some("TIMEOUT"))
+        {
             return Ok(());
         }
     }
@@ -459,7 +466,10 @@ fn parse_operation_ack(
     }
     let value = serde_json::from_str::<serde_json::Value>(response).map_err(|_| ())?;
     let object = value.as_object().ok_or(())?;
-    let success = object.get("ok").and_then(serde_json::Value::as_bool).ok_or(())?;
+    let success = object
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or(())?;
     let expected_keys: &[&str] = if success {
         &["ok", "generation", "session", "scope"]
     } else {
@@ -515,7 +525,9 @@ fn read_frame(
                 Err(ReadFrameError::Stopped)
             };
         }
-        let deadline = input.front_received_at().map(|started_at| started_at + timeout);
+        let deadline = input
+            .front_received_at()
+            .map(|started_at| started_at + timeout);
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(ReadFrameError::Timeout);
         }
@@ -535,7 +547,9 @@ fn read_frame(
                 };
             }
         }
-        let deadline = input.front_received_at().map(|started_at| started_at + timeout);
+        let deadline = input
+            .front_received_at()
+            .map(|started_at| started_at + timeout);
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(ReadFrameError::Timeout);
         }
@@ -548,10 +562,7 @@ fn read_frame(
             if line.pop() != Some('\n') {
                 return Err(ReadFrameError::Invalid);
             }
-            return Ok(ReadFrame::Frame {
-                line,
-                started_at,
-            });
+            return Ok(ReadFrame::Frame { line, started_at });
         }
         if input.buffered_bytes > MAX_FRAME_BYTES {
             return Err(ReadFrameError::TooLarge);
@@ -641,7 +652,10 @@ fn dispatch_request(
     }
 }
 
-fn poll_read_into(stream: &mut LocalStream, scratch: &mut [u8]) -> io::Result<LocalStreamReadCount> {
+fn poll_read_into(
+    stream: &mut LocalStream,
+    scratch: &mut [u8],
+) -> io::Result<LocalStreamReadCount> {
     set_local_stream_polling(stream, true)?;
     let result = poll_local_stream_read_count(stream, scratch);
     let restore = set_local_stream_polling(stream, false);
@@ -653,8 +667,7 @@ fn poll_read_into(stream: &mut LocalStream, scratch: &mut [u8]) -> io::Result<Lo
 }
 
 fn server_is_stopping(running: &AtomicBool, server_stop: Option<&Arc<AtomicBool>>) -> bool {
-    !running.load(Ordering::Acquire)
-        || server_stop.is_some_and(|stop| stop.load(Ordering::Acquire))
+    !running.load(Ordering::Acquire) || server_stop.is_some_and(|stop| stop.load(Ordering::Acquire))
 }
 
 fn write_error_response(
@@ -692,11 +705,7 @@ fn close_session(request_id: &str, owner: &str, api_tx: &ApiRequestSender) {
             operation: InputIntentOperation::Close {},
         }),
     };
-    let _response = super::dispatch_to_app_with_timeout(
-        request,
-        api_tx,
-        Some(REQUEST_TIMEOUT),
-    );
+    let _response = super::dispatch_to_app_with_timeout(request, api_tx, Some(REQUEST_TIMEOUT));
 }
 
 #[cfg(all(test, unix))]
@@ -705,7 +714,6 @@ mod tests {
     use interprocess::local_socket::traits::Listener as _;
     use std::io::{BufRead, BufReader, Write};
     use tokio::sync::mpsc;
-
 
     static NEXT_TEST_SOCKET: AtomicU64 = AtomicU64::new(1);
 
@@ -731,11 +739,18 @@ mod tests {
             for stream in [&client, &server] {
                 let LocalStream::UdSocket(socket) = stream;
                 let enabled: libc::c_int = 1;
-                assert_eq!(unsafe {
-                    libc::setsockopt(socket.as_fd().as_raw_fd(), libc::SOL_SOCKET,
-                        libc::SO_NOSIGPIPE, (&enabled as *const libc::c_int).cast(),
-                        std::mem::size_of_val(&enabled) as libc::socklen_t)
-                }, 0);
+                assert_eq!(
+                    unsafe {
+                        libc::setsockopt(
+                            socket.as_fd().as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            libc::SO_NOSIGPIPE,
+                            (&enabled as *const libc::c_int).cast(),
+                            std::mem::size_of_val(&enabled) as libc::socklen_t,
+                        )
+                    },
+                    0
+                );
             }
         }
         std::fs::remove_file(path).unwrap();
@@ -801,7 +816,9 @@ mod tests {
         stream.flush().unwrap();
     }
 
-    fn take_open(receiver: &mut mpsc::UnboundedReceiver<ApiRequestMessage>) -> (ApiRequestMessage, String) {
+    fn take_open(
+        receiver: &mut mpsc::UnboundedReceiver<ApiRequestMessage>,
+    ) -> (ApiRequestMessage, String) {
         let message = receiver.blocking_recv().unwrap();
         let owner = match &message.request.method {
             Method::PaneInputIntentStreamOpen(params) => {
@@ -836,7 +853,10 @@ mod tests {
         let (message, owner) = take_open(receiver);
         respond_open(message, &owner, generation);
         let response: serde_json::Value = serde_json::from_str(&read_line(stream)).unwrap();
-        assert_eq!(response["result"]["type"], "pane_input_intent_stream_opened");
+        assert_eq!(
+            response["result"]["type"],
+            "pane_input_intent_stream_opened"
+        );
         assert_eq!(response["result"]["session"], owner);
         assert_eq!(response["result"]["generation"], generation);
         owner
@@ -1048,7 +1068,10 @@ mod tests {
         assert_eq!(open.request.id, "intent_public");
         respond_open(open, &owner, 1);
         let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
-        assert_eq!(response["result"]["type"], "pane_input_intent_stream_opened");
+        assert_eq!(
+            response["result"]["type"],
+            "pane_input_intent_stream_opened"
+        );
         drop(client);
         respond_cleanup(&mut receiver, &owner);
         assert!(server.join().unwrap().is_ok());
@@ -1077,7 +1100,10 @@ mod tests {
         let owner = open_direct(&mut client, &mut api_rx, 1);
         stop.store(true, Ordering::Release);
         respond_cleanup(&mut api_rx, &owner);
-        assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
+        assert!(done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_ok());
         server.join().unwrap();
     }
 
@@ -1198,13 +1224,7 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let event_hub = crate::api::EventHub::default();
         let server = std::thread::spawn(move || {
-            super::super::handle_connection(
-                server_stream,
-                &api_tx,
-                &event_hub,
-                &running,
-                None,
-            )
+            super::super::handle_connection(server_stream, &api_tx, &event_hub, &running, None)
         });
         let error: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(error["error"]["code"], "INVALID_REQUEST");
@@ -1235,8 +1255,7 @@ mod tests {
                     .to_string(),
                 )
                 .unwrap();
-            let error: serde_json::Value =
-                serde_json::from_str(&read_line(&mut client)).unwrap();
+            let error: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
             assert_eq!(error["ok"], false);
             assert_eq!(error["generation"], 5);
             assert_eq!(error["error"], "INVALID_REQUEST");
@@ -1261,13 +1280,7 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let event_hub = crate::api::EventHub::default();
         let server = std::thread::spawn(move || {
-            super::super::handle_connection(
-                server_stream,
-                &api_tx,
-                &event_hub,
-                &running,
-                None,
-            )
+            super::super::handle_connection(server_stream, &api_tx, &event_hub, &running, None)
         });
         let error: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(error["error"]["code"], "INVALID_REQUEST");

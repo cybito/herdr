@@ -69,6 +69,21 @@ fn direct_graphics_profile_is_narrow_and_transport_safe() {
     ));
 }
 
+#[test]
+fn server_graphics_files_require_local_filesystem_not_just_local_terminal() {
+    let local = endpoint::ClientEndpointId::Local;
+    let ssh = endpoint::ClientEndpointId::Ssh(
+        endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+    );
+    // Keep old local peers working without requiring a negotiated capability.
+    assert!(server_graphics_files_allowed(&local, false));
+    // Saved SSH endpoints run in the normal local client process.
+    assert!(!server_graphics_files_allowed(&ssh, false));
+    // A standalone --remote bridge can retain the Local endpoint identity.
+    assert!(!server_graphics_files_allowed(&local, true));
+    assert!(!server_graphics_files_allowed(&ssh, true));
+}
+
 fn restore_env_var(key: &str, value: Option<OsString>) {
     if let Some(value) = value {
         std::env::set_var(key, value);
@@ -105,14 +120,19 @@ struct LoopTestTransport {
 fn loop_test_transport() -> (LoopTestTransport, std::sync::mpsc::Receiver<ClientMessage>) {
     let (messages, received) = std::sync::mpsc::channel();
     (
-        LoopTestTransport { messages, disconnected: Arc::new(AtomicBool::new(false)) },
+        LoopTestTransport {
+            messages,
+            disconnected: Arc::new(AtomicBool::new(false)),
+        },
         received,
     )
 }
 
 impl endpoint::EndpointTransport for LoopTestTransport {
     fn send(&mut self, message: &ClientMessage) -> io::Result<()> {
-        self.messages.send(message.clone()).map_err(io::Error::other)?;
+        self.messages
+            .send(message.clone())
+            .map_err(io::Error::other)?;
         Ok(())
     }
 
@@ -122,58 +142,42 @@ impl endpoint::EndpointTransport for LoopTestTransport {
 }
 
 fn loop_test_state() -> ClientState {
-    let mut shell = ClientShellState::new(ClientShellConfig::from_config(&crate::config::Config::default()));
+    let mut shell = ClientShellState::new(ClientShellConfig::from_config(
+        &crate::config::Config::default(),
+    ));
     shell.enable_ime_control();
-    let snapshot: crate::protocol::ClientShellSnapshot = serde_json::from_value(serde_json::json!({
-        "boot_id": "local-boot", "revision": 1, "input_intents": [],
-        "update_install_command": "herdr update", "latest_release_notes_available": false,
-        "integration_updates_available": false, "worktree_directory": "/fixture",
-        "tab_bar_right": [], "tab_bar_right_separator": " ", "agent_order": [],
-        "workspaces": [], "tabs": [], "panes": [], "agents": [], "commands": [],
-    })).unwrap();
-    shell.set_endpoint_snapshot_for_generation(&endpoint::ClientEndpointId::Local, 1, Box::new(snapshot));
+    let snapshot: crate::protocol::ClientShellSnapshot =
+        serde_json::from_value(serde_json::json!({
+            "boot_id": "local-boot", "revision": 1, "input_intents": [],
+            "update_install_command": "herdr update", "latest_release_notes_available": false,
+            "integration_updates_available": false, "worktree_directory": "/fixture",
+            "tab_bar_right": [], "tab_bar_right_separator": " ", "agent_order": [],
+            "workspaces": [], "tabs": [], "panes": [], "agents": [], "commands": [],
+        }))
+        .unwrap();
+    shell.set_endpoint_snapshot_for_generation(
+        &endpoint::ClientEndpointId::Local,
+        1,
+        Box::new(snapshot),
+    );
     shell.set_pane_surface(crate::protocol::PaneSurfaceFrame {
-        boot_id: "local-boot".into(), projection_revision: 1, surface_revision: 1,
-        frame: FrameData::from_ratatui_buffer_with_hyperlinks(
+        boot_id: "local-boot".into(),
+        projection_revision: 1,
+        surface_revision: 1,
+        frame: crate::protocol::FrameData::from_ratatui_buffer_with_hyperlinks(
             &ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24)),
-            None, &[],
+            None,
+            &[],
         ),
-        panes: Vec::new(), splits: Vec::new(), popup: None, graphics: Default::default(),
+        panes: Vec::new(),
+        splits: Vec::new(),
+        popup: None,
+        graphics: Default::default(),
     });
-    ClientState {
-        blit_encoder: render_ansi::BlitEncoder::new(),
-        mouse_capture_active: false,
-        endpoint_mouse_capture_requested: false,
-        endpoint_sgr_pixels_requested: false,
-        host_theme_updates: Vec::new(),
-        direct_mouse_capture_preference: false,
-        shell_mouse_capture_preference: false,
-        direct_keyboard_protocol: crate::terminal_modes::DirectHostKeyboardState::default(),
-        pane_keyboard_report_all: false,
-        keyboard_report_all_active: false,
-        reported_size: (80, 24),
-        reported_cell_size: (0, 0),
-        sound_config: crate::config::SoundConfig::default(),
-        kitty_graphics_enabled: false,
-        pixel_geometry_enabled: false,
-        pixel_geometry_exact: false,
-        #[cfg(unix)]
-        direct_graphics_response: Arc::new(Mutex::new(direct_graphics::ResponseMatcher::default())),
-        #[cfg(unix)]
-        retired_direct_graphics: None,
-        #[cfg(unix)]
-        pending_surface_graphics: HashMap::new(),
-        attach_escape: None,
-        #[cfg(unix)]
-        mouse_scroll_lines: 3,
-        remote_image_paste_key: None,
-        redraw_on_focus_gained: false,
-        repaint_pending: false,
-        presentation_frozen: false,
-        draw_host_cursor: false,
-        detached_process_children: Vec::new(),
-        shell: Some(shell),
-    }
+    let mut state = ClientState::test_new();
+    state.reported_size = (80, 24);
+    state.shell = Some(shell);
+    state
 }
 
 #[test]
@@ -191,18 +195,38 @@ fn unsupported_ime_endpoint_activation_preserves_healthy_local_input() {
             vec![crate::protocol::endpoint::PANE_INPUT_INTENT_CAPABILITY.into()],
         ),
     );
-    endpoints.insert(remote.clone(), remote_transport.clone(), 2, Default::default(), false);
+    endpoints.insert(
+        remote.clone(),
+        remote_transport.clone(),
+        2,
+        Default::default(),
+        false,
+    );
     let mut state = loop_test_state();
-    state.shell.as_mut().unwrap().set_endpoint_catalog(&[profile.clone()]);
-    state.shell.as_mut().unwrap().set_endpoint_status(&remote, endpoint::ClientEndpointStatus::Online);
+    state
+        .shell
+        .as_mut()
+        .unwrap()
+        .set_endpoint_catalog(&[profile.clone()]);
+    state
+        .shell
+        .as_mut()
+        .unwrap()
+        .set_endpoint_status(&remote, endpoint::ClientEndpointStatus::Online);
     let mut supervisors = endpoint::EndpointSupervisors::new(&[profile], now);
     let mut commands = endpoint_commands::EndpointCommands::default();
     let mut pending = None;
 
     assert_eq!(
         reject_unsupported_ime_endpoint(
-            &mut state, &mut endpoints, &mut commands, &mut supervisors, &mut pending,
-            &remote, true, now,
+            &mut state,
+            &mut endpoints,
+            &mut commands,
+            &mut supervisors,
+            &mut pending,
+            &remote,
+            true,
+            now,
         ),
         Some(false),
     );
@@ -216,13 +240,25 @@ fn unsupported_ime_endpoint_activation_preserves_healthy_local_input() {
     );
     assert!(remote_transport.disconnected.load(Ordering::Acquire));
     assert!(!local_transport.disconnected.load(Ordering::Acquire));
-    assert!(matches!(local_messages.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+    assert!(matches!(
+        local_messages.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
     let frame = state.shell.as_mut().unwrap().compose(100, 30).unwrap();
-    let text = frame.cells.iter().map(|cell| cell.symbol.as_str()).collect::<String>();
-    assert!(text.contains("IME_INTENT_UNSUPPORTED"), "refusal must remain visible: {text}");
+    let text = frame
+        .cells
+        .iter()
+        .map(|cell| cell.symbol.as_str())
+        .collect::<String>();
+    assert!(
+        text.contains("IME_INTENT_UNSUPPORTED"),
+        "refusal must remain visible: {text}"
+    );
 
     require_client_input_intents(state.shell.as_ref(), &endpoints, true).unwrap();
-    let input = ClientMessage::Input { data: b"local remains usable".to_vec() };
+    let input = ClientMessage::Input {
+        data: b"local remains usable".to_vec(),
+    };
     assert_eq!(endpoints.send(&input), endpoint::EndpointSendOutcome::Sent);
     assert_eq!(local_messages.try_iter().collect::<Vec<_>>(), vec![input]);
 }
@@ -233,13 +269,17 @@ async fn ready_ime_input_and_endpoint_events_each_receive_bounded_turns() {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
     let (supervisor_tx, mut supervisor_rx) = tokio::sync::mpsc::channel(16);
     for _ in 0..16 {
-        assert!(event_tx.try_send(ClientLoopEvent::StdinInput(b"\x1b[O".to_vec())).is_ok());
-        assert!(supervisor_tx.try_send(endpoint::EndpointSupervisorEvent::Status {
-            endpoint_id: endpoint::ClientEndpointId::Local,
-            generation: 1,
-            status: endpoint::ClientEndpointStatus::Online,
-            message: String::new(),
-        }).is_ok());
+        assert!(event_tx
+            .try_send(ClientLoopEvent::StdinInput(b"\x1b[O".to_vec()))
+            .is_ok());
+        assert!(supervisor_tx
+            .try_send(endpoint::EndpointSupervisorEvent::Status {
+                endpoint_id: endpoint::ClientEndpointId::Local,
+                generation: 1,
+                status: endpoint::ClientEndpointStatus::Online,
+                message: String::new(),
+            })
+            .is_ok());
     }
     let mut scheduler = ClientEventScheduler::default();
     let mut scheduled = None;
@@ -248,7 +288,16 @@ async fn ready_ime_input_and_endpoint_events_each_receive_bounded_turns() {
     let mut focus_reports = 0;
     let mut endpoint_reports = 0;
     for _ in 0..6 {
-        match scheduler.next(&mut scheduled, true, deadline, &mut event_rx, &mut supervisor_rx).await {
+        match scheduler
+            .next(
+                &mut scheduled,
+                true,
+                deadline,
+                &mut event_rx,
+                &mut supervisor_rx,
+            )
+            .await
+        {
             ClientLoopEvent::ImeDrain => drains += 1,
             ClientLoopEvent::StdinInput(bytes) => {
                 assert!(matches!(
@@ -261,9 +310,18 @@ async fn ready_ime_input_and_endpoint_events_each_receive_bounded_turns() {
             _ => panic!("unexpected scheduling result"),
         }
     }
-    assert!(drains >= 2, "already-authorized input must not wait behind sustained traffic");
-    assert!(focus_reports >= 1, "input dispatch must yield to real focus reports");
-    assert!(endpoint_reports >= 1, "reconnection results must remain consumable");
+    assert!(
+        drains >= 2,
+        "already-authorized input must not wait behind sustained traffic"
+    );
+    assert!(
+        focus_reports >= 1,
+        "input dispatch must yield to real focus reports"
+    );
+    assert!(
+        endpoint_reports >= 1,
+        "reconnection results must remain consumable"
+    );
 }
 
 #[cfg(unix)]
@@ -274,29 +332,61 @@ async fn due_timer_services_endpoint_health_before_ready_business_or_ime_work() 
     let remote = endpoint::ClientEndpointId::Ssh(profile.id);
     let (transport, messages) = loop_test_transport();
     let mut endpoints = endpoint::EndpointRegistry::empty();
-    endpoints.insert(remote.clone(), transport.clone(), 2, endpoint::EndpointNegotiation::new(
-        Vec::new(), vec![crate::protocol::endpoint::HEALTH_CHECK_CAPABILITY.into()],
-    ), false);
+    endpoints.insert(
+        remote.clone(),
+        transport.clone(),
+        2,
+        endpoint::EndpointNegotiation::new(
+            Vec::new(),
+            vec![crate::protocol::endpoint::HEALTH_CHECK_CAPABILITY.into()],
+        ),
+        false,
+    );
     endpoints.mark_ready(&remote, 2);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
     let (supervisor_tx, mut supervisor_rx) = tokio::sync::mpsc::channel(1);
-    assert!(event_tx.try_send(ClientLoopEvent::Resize(80, 24, 0, 0, false)).is_ok());
-    assert!(supervisor_tx.try_send(endpoint::EndpointSupervisorEvent::Status {
-        endpoint_id: remote.clone(), generation: 2,
-        status: endpoint::ClientEndpointStatus::Online, message: String::new(),
-    }).is_ok());
+    assert!(event_tx
+        .try_send(ClientLoopEvent::Resize(80, 24, 0, 0, false))
+        .is_ok());
+    assert!(supervisor_tx
+        .try_send(endpoint::EndpointSupervisorEvent::Status {
+            endpoint_id: remote.clone(),
+            generation: 2,
+            status: endpoint::ClientEndpointStatus::Online,
+            message: String::new(),
+        })
+        .is_ok());
     let mut scheduler = ClientEventScheduler::default();
     let due = now - Duration::from_secs(1);
     for ime_ready in [false, true] {
         let mut scheduled = Some(ClientLoopEvent::ActivateEndpoint {
-            endpoint_id: remote.clone(), target: None, force: false,
+            endpoint_id: remote.clone(),
+            target: None,
+            force: false,
         });
         assert!(matches!(
-            scheduler.next(&mut scheduled, ime_ready, due, &mut event_rx, &mut supervisor_rx).await,
+            scheduler
+                .next(
+                    &mut scheduled,
+                    ime_ready,
+                    due,
+                    &mut event_rx,
+                    &mut supervisor_rx
+                )
+                .await,
             ClientLoopEvent::Timer,
         ));
-        assert!(scheduled.is_some(), "due maintenance must not discard a scheduled handoff");
-        endpoints.tick_health(now + if ime_ready { Duration::from_secs(20) } else { Duration::from_secs(6) });
+        assert!(
+            scheduled.is_some(),
+            "due maintenance must not discard a scheduled handoff"
+        );
+        endpoints.tick_health(
+            now + if ime_ready {
+                Duration::from_secs(20)
+            } else {
+                Duration::from_secs(6)
+            },
+        );
     }
     assert!(matches!(
         messages.try_iter().collect::<Vec<_>>().as_slice(),
@@ -304,13 +394,38 @@ async fn due_timer_services_endpoint_health_before_ready_business_or_ime_work() 
     ));
     assert!(transport.disconnected.load(Ordering::Acquire));
     let failures = endpoints.take_failures();
-    assert!(matches!(failures.as_slice(), [failure] if failure.endpoint_id == remote && failure.kind == io::ErrorKind::TimedOut));
+    assert!(
+        matches!(failures.as_slice(), [failure] if failure.endpoint_id == remote && failure.kind == io::ErrorKind::TimedOut)
+    );
 }
 
 #[test]
 fn windows_virtual_terminal_input_mode_sets_only_vti_bit() {
     assert_eq!(windows_virtual_terminal_input_mode(0x01f0), 0x03f0);
     assert_eq!(windows_virtual_terminal_input_mode(0x03f0), 0x03f0);
+}
+
+#[test]
+fn windows_win32_input_mode_defaults_to_win32_and_honors_probe() {
+    let _guard = env_lock().lock().unwrap();
+    let _removed =
+        EnvVarsRemovedGuard::new(&["HERDR_WINDOWS_INPUT_PROBE", "SSH_CONNECTION", "SSH_TTY"]);
+
+    assert!(windows_win32_input_mode_enabled());
+    {
+        let _ssh = EnvVarGuard::set("SSH_CONNECTION", "1 2 3 4");
+        assert!(windows_win32_input_mode_enabled());
+        let _probe = EnvVarGuard::set("HERDR_WINDOWS_INPUT_PROBE", "WiN32");
+        assert!(windows_win32_input_mode_enabled());
+    }
+    {
+        let _ssh = EnvVarGuard::set("SSH_TTY", "terminal");
+        assert!(windows_win32_input_mode_enabled());
+        let _probe = EnvVarGuard::set("HERDR_WINDOWS_INPUT_PROBE", "vT");
+        assert!(!windows_win32_input_mode_enabled());
+    }
+    let _probe = EnvVarGuard::set("HERDR_WINDOWS_INPUT_PROBE", "win32");
+    assert!(windows_win32_input_mode_enabled());
 }
 
 struct EnvVarsRemovedGuard {
@@ -429,10 +544,12 @@ fn clipboard_image_paste_bridge_triggers_on_configured_key_and_empty_paste() {
     ));
 }
 
+#[cfg(unix)]
 struct TempImageFile {
     path: std::path::PathBuf,
 }
 
+#[cfg(unix)]
 impl TempImageFile {
     fn new(extension: &str, bytes: &[u8]) -> Self {
         Self::with_name_fragment("test", extension, bytes)
@@ -452,6 +569,7 @@ impl TempImageFile {
     }
 }
 
+#[cfg(unix)]
 impl Drop for TempImageFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -606,11 +724,6 @@ fn color_scheme_change_event_requests_host_theme_query() {
     assert!(crate::raw_input::events_require_host_terminal_theme_query(
         &events
     ));
-}
-
-#[test]
-fn host_terminal_theme_query_is_disabled_on_windows() {
-    assert_eq!(should_query_host_terminal_theme(), !cfg!(windows));
 }
 
 #[test]
@@ -1057,6 +1170,67 @@ fn terminal_control_resize_command_maps_to_client_resize() {
 }
 
 #[test]
+fn terminal_control_mouse_command_maps_to_attach_mouse() {
+    let action = terminal_control_command_from_json(
+        r#"{"type":"terminal.mouse","action":"down","column":12,"row":5}"#,
+    )
+    .unwrap();
+    let ClientMessage::AttachMouse {
+        kind,
+        position,
+        geometry,
+        modifiers,
+        lines,
+    } = action
+    else {
+        panic!("expected attach mouse command");
+    };
+    assert_eq!(
+        kind,
+        crate::protocol::ClientMouseKind::Down(crate::protocol::ClientMouseButton::Left)
+    );
+    assert_eq!(
+        position,
+        crate::protocol::ClientMousePosition::Cell { column: 12, row: 5 }
+    );
+    assert_eq!((geometry, modifiers, lines), (None, 0, 1));
+}
+
+#[test]
+fn terminal_control_mouse_command_maps_every_action_and_button() {
+    use crate::protocol::{ClientMouseButton as Button, ClientMouseKind as Kind};
+    for (json, expected) in [
+        (r#""action":"up","button":"right""#, Kind::Up(Button::Right)),
+        (
+            r#""action":"drag","button":"middle""#,
+            Kind::Drag(Button::Middle),
+        ),
+        (r#""action":"move""#, Kind::Moved),
+    ] {
+        let raw = format!(r#"{{"type":"terminal.mouse",{json},"column":0,"row":0,"modifiers":4}}"#);
+        let ClientMessage::AttachMouse {
+            kind, modifiers, ..
+        } = terminal_control_command_from_json(&raw).unwrap()
+        else {
+            panic!("expected attach mouse command");
+        };
+        assert_eq!((kind, modifiers), (expected, 4), "{raw}");
+    }
+}
+
+#[test]
+fn terminal_control_mouse_command_rejects_unknown_actions_and_missing_cells() {
+    assert!(terminal_control_command_from_json(
+        r#"{"type":"terminal.mouse","action":"click","column":1,"row":1}"#
+    )
+    .is_err());
+    assert!(terminal_control_command_from_json(
+        r#"{"type":"terminal.mouse","action":"down","column":1}"#
+    )
+    .is_err());
+}
+
+#[test]
 fn terminal_control_scroll_command_maps_to_attach_scroll() {
     let action = terminal_control_command_from_json(
         r#"{"type":"terminal.scroll","direction":"up","lines":3}"#,
@@ -1078,12 +1252,8 @@ fn terminal_control_scroll_command_maps_to_attach_scroll() {
 
 #[test]
 fn forward_clipboard_uses_local_clipboard_path() {
-    unsafe {
-        std::env::set_var("SSH_CONNECTION", "1 2 3 4");
-    }
+    let _guard = env_lock().lock().unwrap();
+    let _ssh = EnvVarGuard::set("SSH_CONNECTION", "1 2 3 4");
     assert!(forward_clipboard("dGVzdA=="));
     assert!(!forward_clipboard("not base64"));
-    unsafe {
-        std::env::remove_var("SSH_CONNECTION");
-    }
 }

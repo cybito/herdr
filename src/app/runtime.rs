@@ -32,10 +32,7 @@ impl App {
         terminal_id: crate::terminal::TerminalId,
         runtime: crate::terminal::TerminalRuntime,
     ) {
-        if let Some(previous) = self
-            .terminal_runtimes
-            .insert(terminal_id.clone(), runtime)
-        {
+        if let Some(previous) = self.terminal_runtimes.insert(terminal_id.clone(), runtime) {
             self.retire_input_intents_for_terminal(&terminal_id);
             previous.shutdown();
         }

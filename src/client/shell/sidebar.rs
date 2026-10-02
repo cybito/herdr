@@ -4,6 +4,26 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
+fn workspace_selection_background(palette: &Palette) -> ratatui::style::Color {
+    if palette.selection_bg == ratatui::style::Color::Reset {
+        palette.active_row_bg
+    } else {
+        palette.selection_bg
+    }
+}
+
+pub(in crate::client::shell) fn workspace_active_background(
+    palette: &Palette,
+    navigating: bool,
+) -> ratatui::style::Color {
+    // The fallback cursor shares the active-row color; only fill the cursor while navigating.
+    if navigating && palette.selection_bg == ratatui::style::Color::Reset {
+        palette.sidebar_bg
+    } else {
+        palette.active_row_bg
+    }
+}
+
 pub(in crate::client::shell) fn collapsed_sidebar_sections(
     area: Rect,
 ) -> (Rect, Option<u16>, Rect) {
@@ -33,6 +53,8 @@ pub(crate) fn render_collapsed_sidebar(
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
+    let selection_background = workspace_selection_background(palette);
+    let active_background = workspace_active_background(palette, selected_workspace_id.is_some());
     render_sidebar_background(buffer, area, palette);
     let (workspace_area, divider_y, detail_area) = collapsed_sidebar_sections(area);
     for (index, workspace) in snapshot
@@ -48,23 +70,17 @@ pub(crate) fn render_collapsed_sidebar(
             1,
         );
         let selected = selected_workspace_id == Some(workspace.workspace_id.as_str());
-        let selection_background =
-            if workspace.focused && palette.selection_bg == ratatui::style::Color::Reset {
-                palette.active_row_bg
-            } else {
-                palette.selection_bg
-            };
         if selected {
             buffer.set_style(rect, Style::default().bg(selection_background));
         } else if workspace.focused {
-            buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
+            buffer.set_style(rect, Style::default().bg(active_background));
         }
         let number_style = if selected {
             Style::default()
                 .fg(palette.overlay1)
                 .bg(selection_background)
         } else if workspace.focused {
-            Style::default().fg(palette.text).bg(palette.active_row_bg)
+            Style::default().fg(palette.text).bg(active_background)
         } else {
             Style::default().fg(palette.overlay0)
         };
@@ -294,7 +310,9 @@ pub(crate) fn render_sidebar(
             break;
         }
         let rect = Rect::new(body.x, y, content_width, row_height);
-        let selected = state.selected_workspace_id == Some(workspace.workspace_id.as_str());
+        let selected = state.selected_workspace_id.is_some_and(|target| {
+            target.matches(state.active_endpoint_id, &workspace.workspace_id)
+        });
         let dragged = state.dragged_workspace_id == Some(workspace.workspace_id.as_str());
         if selected {
             buffer.set_style(rect, Style::default().bg(palette.selection_bg));
@@ -306,32 +324,24 @@ pub(crate) fn render_sidebar(
         render_workspace_rows(
             buffer,
             rect,
-            workspace,
             status,
             config.status_indicators,
             entry,
             rows,
-            true,
+            workspace.focused,
             selected,
+            state.selected_workspace_id.is_some(),
             dragged,
             palette,
         );
-        let group_toggle = parent_group_key(snapshot, entry.index).map(|key| {
-            let rect = Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1);
-            put_text(
-                buffer,
-                rect.x,
-                rect.y,
-                rect.width,
-                if state.collapsed_groups.contains(&key) {
-                    "▸"
-                } else {
-                    "▾"
-                },
-                Style::default().fg(palette.accent),
-            );
-            (rect, key)
-        });
+        let group_toggle = render_parent_group_toggle(
+            buffer,
+            rect,
+            snapshot,
+            entry.index,
+            state.collapsed_groups,
+            palette,
+        );
         hits.workspaces.push(WorkspaceHit {
             rect,
             endpoint_id: ClientEndpointId::Local,
@@ -534,7 +544,7 @@ pub(crate) fn workspace_entries(
     entries
 }
 
-pub(super) fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> Option<String> {
+fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> Option<String> {
     let workspace = snapshot.workspaces.get(index)?;
     let worktree = workspace.worktree.as_ref()?;
     if worktree.is_linked_worktree {
@@ -554,7 +564,37 @@ pub(super) fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> 
         .then(|| worktree.key.clone())
 }
 
-pub(super) fn displayed_workspace_status(
+pub(in crate::client::shell) fn render_parent_group_toggle(
+    buffer: &mut Buffer,
+    workspace_rect: Rect,
+    snapshot: &ClientShellSnapshot,
+    workspace_index: usize,
+    collapsed_groups: &HashSet<String>,
+    palette: &Palette,
+) -> Option<(Rect, String)> {
+    let key = parent_group_key(snapshot, workspace_index)?;
+    let toggle = Rect::new(
+        workspace_rect.right().saturating_sub(1),
+        workspace_rect.y,
+        1,
+        1,
+    );
+    put_text(
+        buffer,
+        toggle.x,
+        toggle.y,
+        toggle.width,
+        if collapsed_groups.contains(&key) {
+            "▸"
+        } else {
+            "▾"
+        },
+        Style::default().fg(palette.accent),
+    );
+    Some((toggle, key))
+}
+
+pub(in crate::client::shell) fn displayed_workspace_status(
     snapshot: &ClientShellSnapshot,
     workspace: &ClientShellWorkspace,
     collapsed_groups: &HashSet<String>,
@@ -615,13 +655,13 @@ pub(in crate::client::shell) fn workspace_rows(
 pub(in crate::client::shell) fn render_workspace_rows(
     buffer: &mut Buffer,
     area: Rect,
-    workspace: &ClientShellWorkspace,
     status: crate::api::schema::AgentStatus,
     indicators: crate::config::StatusIndicatorStyle,
     entry: &WorkspaceEntry,
     rows: Vec<Vec<crate::ui::ResolvedToken>>,
-    endpoint_active: bool,
+    focused: bool,
     selected: bool,
+    navigating: bool,
     dragged: bool,
     palette: &Palette,
 ) {
@@ -656,7 +696,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
         } else {
             x = x.saturating_add(3);
         }
-        let highlighted = endpoint_active && workspace.focused || dragged;
+        let highlighted = focused || dragged;
         let workspace_style = Style::default()
             .fg(if highlighted {
                 palette.text
@@ -668,7 +708,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
             } else {
                 Modifier::empty()
             });
-        let secondary_style = Style::default().fg(if endpoint_active && workspace.focused {
+        let secondary_style = Style::default().fg(if focused {
             palette.mauve
         } else {
             palette.overlay0
@@ -679,9 +719,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
                 status_icon(status, indicators),
                 Style::default().fg(status_color(status, palette)),
             ),
-            Style::default()
-                .fg(status_color(status, palette))
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(status_color(status, palette)),
             workspace_style,
             secondary_style,
             Style::default().fg(palette.overlay1),
@@ -695,11 +733,11 @@ pub(in crate::client::shell) fn render_workspace_rows(
     }
 
     let background = if selected {
-        Some(palette.selection_bg)
+        Some(workspace_selection_background(palette))
     } else if dragged {
         Some(palette.surface1)
-    } else if endpoint_active && workspace.focused {
-        Some(palette.active_row_bg)
+    } else if focused {
+        Some(workspace_active_background(palette, navigating))
     } else {
         None
     };
