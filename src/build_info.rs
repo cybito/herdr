@@ -34,4 +34,3 @@ fn non_empty(value: Option<&'static str>) -> Option<&'static str> {
         }
     })
 }
-
