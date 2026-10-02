@@ -258,18 +258,6 @@ impl ImeGate {
     }
 
     fn physical_binding(&self, shell: &ClientShellState, endpoints: &EndpointRegistry) -> Option<InputBinding> {
-        if endpoints.connection(endpoints.active_id()).is_some_and(|connection| connection.generation > 1) {
-            tracing::debug!(
-                available = endpoints.active_surface_available(),
-                online = shell.endpoint_is_online(endpoints.active_id()),
-                active_matches = &shell.active_endpoint_id == endpoints.active_id(),
-                connection_generation = ?endpoints.connection(endpoints.active_id()).map(|connection| connection.generation),
-                cache_generation = ?self.cache.iter().find(|cached| &cached.route.endpoint_id == endpoints.active_id()).map(|cached| cached.route.connection_generation),
-                projected = ?shell.snapshot.as_deref().map(|snapshot| (&snapshot.boot_id, snapshot.revision, &snapshot.focused_pane_id)),
-                metadata = ?shell.endpoints.iter().find(|endpoint| &endpoint.endpoint_id == endpoints.active_id()).map(|endpoint| (endpoint.status, endpoint.snapshot_generation, endpoint.snapshot.as_deref().map(|snapshot| (&snapshot.boot_id, snapshot.revision, snapshot.input_intents.is_some())))),
-                "private reconnect route diagnostic"
-            );
-        }
         if !endpoints.active_surface_available() || !shell.endpoint_is_online(endpoints.active_id()) || &shell.active_endpoint_id != endpoints.active_id() { return None }
         let cached = self.cache.iter().find(|cached| &cached.route.endpoint_id == endpoints.active_id())?;
         let projected = shell.snapshot.as_deref()?;

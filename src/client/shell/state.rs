@@ -1302,13 +1302,8 @@ impl ClientShellState {
         );
         let endpoint_boot_changed =
             self.snapshot.is_some() && self.graphics.scope() != graphics_scope;
-        if !endpoint_boot_changed
-            && self.snapshot.as_ref().is_some_and(|current| {
-                current.boot_id == snapshot.boot_id && snapshot.revision < current.revision
-            })
-        {
-            return;
-        }
+        // Endpoint caches already reject older revisions within their connection generation.
+        // A same-boot reconnect may legitimately restart that connection's revision counter.
         self.graphics.set_scope(&graphics_scope);
         let command_bindings_changed = self.snapshot.as_ref().is_none_or(|current| {
             current.commands.len() != snapshot.commands.len()

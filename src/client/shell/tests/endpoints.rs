@@ -70,6 +70,29 @@ fn advertised_missing_roster_is_rejected_but_stale_replacements_are_ignored() {
 }
 
 #[test]
+fn reconnect_projects_lower_revision_only_after_surface_activation() {
+    let (mut state, _) = state_with_remote();
+    let endpoint_id = ClientEndpointId::Local;
+    let mut previous = snapshot();
+    previous.revision = 55;
+    previous.input_intents = Some(std::sync::Arc::from([]));
+    state.set_endpoint_snapshot_for_generation(&endpoint_id, 1, Box::new(previous));
+    let mut current = snapshot();
+    current.revision = 1;
+    current.input_intents = Some(std::sync::Arc::from([]));
+    state.cache_endpoint_snapshot_inactive_for_generation(&endpoint_id, 2, Box::new(current.clone()));
+    assert_eq!(state.snapshot.as_ref().unwrap().revision, 55);
+    assert!(matches!(state.require_endpoint_input_intents(&endpoint_id, 2), Err(crate::client::ClientError::InputIntentProtocolError)));
+    assert!(state.activate_endpoint_projection(&endpoint_id));
+    state.require_endpoint_input_intents(&endpoint_id, 2).unwrap();
+    assert_eq!(state.snapshot.as_ref().unwrap().revision, 1);
+    current.revision = 0;
+    state.set_endpoint_snapshot_for_generation(&endpoint_id, 2, Box::new(current));
+    assert_eq!(state.snapshot.as_ref().unwrap().revision, 1);
+    state.require_endpoint_input_intents(&endpoint_id, 2).unwrap();
+}
+
+#[test]
 fn complete_empty_roster_allows_input_without_a_reporter() {
     let (mut state, _) = state_with_remote();
     let endpoint_id = ClientEndpointId::Local;
