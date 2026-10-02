@@ -440,6 +440,9 @@ impl ImeGate {
     }
 
     pub(in crate::client) fn enqueue(&mut self, shell: &mut ClientShellState, endpoints: &EndpointRegistry, raw: Vec<u8>, events: Vec<RawInputEvent>, pixels: Option<crate::input::mouse::HostPixels>, frozen: bool, now: Instant) -> Result<ClientShellInput, ClientError> {
+        // A disconnected surface has no input route, even without an activation in flight.
+        // Cancel new semantic input; retain independent releases and focus handling below.
+        let frozen = frozen || !endpoints.active_surface_available();
         self.synchronize(shell, endpoints, frozen, now)?;
         let mut semantic: VecDeque<RawInputEvent> = events.into();
         let mut outcome = ClientShellInput::default();
@@ -789,6 +792,44 @@ mod tests {
         registry.set_surface_active(&ClientEndpointId::Local, true);
         registry.unfreeze_input();
         assert!(matches!(gate.synchronize(&mut shell, &registry, false, now), Err(ClientError::InputIntentUnsupported)));
+    }
+
+    #[test]
+    fn disconnected_input_is_cancelled_without_replay_after_reconnect() {
+        let (mut gate, mut shell, mut registry, messages) = fixture(Some(InputIntentState::Command));
+        let now = Instant::now();
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+        applied(&mut gate);
+        let old_authorization = gate.authorization.as_ref().unwrap().clone();
+        let snapshot = shell.snapshot.as_ref().unwrap().as_ref().clone();
+        registry.disconnect(&ClientEndpointId::Local);
+        shell.mark_endpoint_disconnected(&ClientEndpointId::Local);
+        let outcome = gate.enqueue(&mut shell, &registry, b"j".to_vec(), crate::raw_input::parse_raw_input_bytes_sync(b"j"), None, false, now).unwrap();
+        assert!(outcome.requests.is_empty() && outcome.routed_requests.is_empty());
+        assert!(gate.batches.is_empty());
+        assert!(gate.pending_plan.as_ref().unwrap().desired.is_none());
+        assert!(gate.pending_plan.as_ref().unwrap().live_leases.is_empty());
+        assert!(shell.endpoint_error.as_deref().is_some_and(|error| error.starts_with("IME_INPUT_CANCELLED:")));
+        gate.complete(Completion { authorization: old_authorization, result: Ok(AckScope::Applied) }).unwrap();
+        assert!(!gate.applied);
+        assert!(matches!(messages.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+        let (sender, reconnected) = mpsc::channel();
+        registry.insert(ClientEndpointId::Local, RecordingTransport(sender), 2, negotiation(), false);
+        shell.set_endpoint_snapshot_for_generation(&ClientEndpointId::Local, 2, Box::new(snapshot));
+        shell.set_endpoint_status(&ClientEndpointId::Local, ClientEndpointStatus::Online);
+        enqueue(&mut gate, &mut shell, &registry, b"j", now);
+        assert!(gate.batches.is_empty());
+        assert!(matches!(reconnected.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        registry.set_surface_active(&ClientEndpointId::Local, true);
+        enqueue(&mut gate, &mut shell, &registry, b"k", now);
+        assert!(dispatch(&mut gate, &mut shell, &mut registry, now).is_none());
+        assert!(matches!(reconnected.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        applied(&mut gate);
+        let outcome = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+        send(&shell, &mut registry, outcome);
+        let forwarded = reconnected.try_iter().collect::<Vec<_>>();
+        assert!(matches!(forwarded.as_slice(), [ClientMessage::ClientShellPaneInput { events, .. }]
+            if matches!(events.as_slice(), [crate::protocol::ClientPaneInputEvent::Key { generated_text: Some(text), .. }] if text == "k")));
     }
 
     #[test]
