@@ -261,7 +261,7 @@ impl ImeGate {
         if !endpoints.active_surface_available() || !shell.endpoint_is_online(endpoints.active_id()) || &shell.active_endpoint_id != endpoints.active_id() { return None }
         let cached = self.cache.iter().find(|cached| &cached.route.endpoint_id == endpoints.active_id())?;
         let projected = shell.snapshot.as_deref()?;
-        if projected.boot_id.as_str() != cached.route.boot_id.as_ref() { return None }
+        shell.require_endpoint_input_intents(endpoints.active_id(), cached.route.connection_generation).ok()?;
         let terminal = if shell.popup_pending { None } else if let Some(popup) = shell.popup_terminal_id.as_deref() {
             Some(self.binding.as_ref().and_then(|binding| binding.terminal.as_ref()).filter(|terminal| terminal.as_ref() == popup).cloned().unwrap_or_else(|| Arc::from(popup)))
         } else {
@@ -440,10 +440,10 @@ impl ImeGate {
     }
 
     pub(in crate::client) fn enqueue(&mut self, shell: &mut ClientShellState, endpoints: &EndpointRegistry, raw: Vec<u8>, events: Vec<RawInputEvent>, pixels: Option<crate::input::mouse::HostPixels>, frozen: bool, now: Instant) -> Result<ClientShellInput, ClientError> {
-        // A disconnected surface has no input route, even without an activation in flight.
-        // Cancel new semantic input; retain independent releases and focus handling below.
-        let frozen = frozen || !endpoints.active_surface_available();
         self.synchronize(shell, endpoints, frozen, now)?;
+        // A disconnected or incoherent projection has no input route.
+        // Cancel new semantic input; retain independent releases and focus handling below.
+        let frozen = frozen || self.binding.is_none();
         let mut semantic: VecDeque<RawInputEvent> = events.into();
         let mut outcome = ClientShellInput::default();
         let mut discarded = false;
@@ -801,7 +801,7 @@ mod tests {
         gate.synchronize(&mut shell, &registry, false, now).unwrap();
         applied(&mut gate);
         let old_authorization = gate.authorization.as_ref().unwrap().clone();
-        let snapshot = shell.snapshot.as_ref().unwrap().as_ref().clone();
+        let mut snapshot = shell.snapshot.as_ref().unwrap().as_ref().clone();
         registry.disconnect(&ClientEndpointId::Local);
         shell.mark_endpoint_disconnected(&ClientEndpointId::Local);
         let outcome = gate.enqueue(&mut shell, &registry, b"j".to_vec(), crate::raw_input::parse_raw_input_bytes_sync(b"j"), None, false, now).unwrap();
@@ -815,6 +815,17 @@ mod tests {
         assert!(matches!(messages.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
         let (sender, reconnected) = mpsc::channel();
         registry.insert(ClientEndpointId::Local, RecordingTransport(sender), 2, negotiation(), false);
+        shell.set_endpoint_status(&ClientEndpointId::Local, ClientEndpointStatus::Online);
+        registry.set_surface_active(&ClientEndpointId::Local, true);
+        enqueue(&mut gate, &mut shell, &registry, b"j", now);
+        assert!(gate.batches.is_empty());
+        assert!(matches!(reconnected.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        snapshot.revision += 1;
+        shell.cache_endpoint_snapshot_for_generation(&ClientEndpointId::Local, 2, Box::new(snapshot.clone()));
+        enqueue(&mut gate, &mut shell, &registry, b"j", now);
+        assert!(gate.batches.is_empty());
+        assert!(matches!(reconnected.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        registry.set_surface_active(&ClientEndpointId::Local, false);
         shell.set_endpoint_snapshot_for_generation(&ClientEndpointId::Local, 2, Box::new(snapshot));
         shell.set_endpoint_status(&ClientEndpointId::Local, ClientEndpointStatus::Online);
         enqueue(&mut gate, &mut shell, &registry, b"j", now);
@@ -830,6 +841,10 @@ mod tests {
         let forwarded = reconnected.try_iter().collect::<Vec<_>>();
         assert!(matches!(forwarded.as_slice(), [ClientMessage::ClientShellPaneInput { events, .. }]
             if matches!(events.as_slice(), [crate::protocol::ClientPaneInputEvent::Key { generated_text: Some(text), .. }] if text == "k")));
+        let mut malformed = shell.snapshot.as_ref().unwrap().as_ref().clone();
+        malformed.input_intents = None;
+        shell.set_endpoint_snapshot_for_generation(&ClientEndpointId::Local, 2, Box::new(malformed));
+        assert!(matches!(gate.synchronize(&mut shell, &registry, false, now), Err(ClientError::InputIntentProtocolError)));
     }
 
     #[test]
