@@ -391,7 +391,7 @@ pub struct TerminalInputIntents {
     pub sessions: Vec<InputIntentSession>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PaneInputIntentStreamParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -399,8 +399,37 @@ pub struct PaneInputIntentStreamParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub popup_terminal_id: Option<String>,
     #[serde(skip)]
-    #[schemars(skip)]
     pub owner: String,
+}
+
+impl schemars::JsonSchema for PaneInputIntentStreamParams {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "PaneInputIntentStreamParams".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // Match exactly one nonempty target, including Rust str::trim whitespace.
+        schemars::json_schema!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "pane_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "[^\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]"
+                },
+                "popup_terminal_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "[^\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]"
+                }
+            },
+            "oneOf": [
+                { "required": ["pane_id"] },
+                { "required": ["popup_terminal_id"] }
+            ]
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

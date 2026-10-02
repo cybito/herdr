@@ -225,9 +225,7 @@ fn serve_with_timeout(
             }
         };
 
-        if let Err(err) = write_text_line_allow_disconnect(&mut stream, &response) {
-            return Err(err);
-        }
+        write_text_line_allow_disconnect(&mut stream, &response)?;
         open_gate.store(false, Ordering::Release);
         serve_operations(
             &mut stream,
@@ -434,9 +432,7 @@ fn serve_operations(
             outcome,
             "input intent operation completed"
         );
-        if let Err(err) = write_text_line_allow_disconnect(stream, &response) {
-            return Err(err);
-        }
+        write_text_line_allow_disconnect(stream, &response)?;
         if matches!(operation_name, "close") || (!ack.ok && ack.error.as_deref() == Some("TIMEOUT"))
         {
             return Ok(());

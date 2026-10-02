@@ -386,7 +386,7 @@ mod tests {
             sessions_for(&store, &terminal_id),
             vec![("new".into(), true)]
         );
-        assert_eq!(store.owner_for(&terminal_id).as_deref(), Some("new"));
+        assert_eq!(store.owner_for(&terminal_id), Some("new"));
     }
 
     #[test]

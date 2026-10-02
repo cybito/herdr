@@ -70,28 +70,30 @@ pub fn restore(
     rows: u16,
     cols: u16,
     scrollback_limit_bytes: usize,
-    default_shell: &str,
-    shell_mode: crate::config::ShellModeConfig,
+    shell_config: crate::pane::PaneShellConfig<'_>,
     resume_agents_on_restore: bool,
     ime_control_enabled: bool,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> RestoredSession {
+    let runtime_context = RestoreRuntimeContext {
+        scrollback_limit_bytes,
+        shell_config,
+        ime_control_enabled,
+        resume_agents_on_restore,
+        events,
+        render_notify,
+        render_dirty,
+    };
     let mut imported_panes = HashMap::new();
     restore_with_imports(
         snapshot,
         history,
         rows,
         cols,
-        scrollback_limit_bytes,
-        crate::pane::PaneShellConfig::new(default_shell, shell_mode),
-        resume_agents_on_restore,
-        ime_control_enabled,
+        &runtime_context,
         &mut imported_panes,
-        events,
-        render_notify,
-        render_dirty,
     )
 }
 
@@ -107,20 +109,16 @@ pub fn restore_handoff(
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> std::io::Result<RestoredSession> {
-    restore_with_imports_strict(
-        snapshot,
-        None,
-        24,
-        80,
+    let runtime_context = RestoreRuntimeContext {
         scrollback_limit_bytes,
-        crate::pane::PaneShellConfig::new(default_shell, shell_mode),
-        true,
+        shell_config: crate::pane::PaneShellConfig::new(default_shell, shell_mode),
         ime_control_enabled,
-        imports,
+        resume_agents_on_restore: true,
         events,
         render_notify,
         render_dirty,
-    )
+    };
+    restore_with_imports_strict(snapshot, None, 24, 80, &runtime_context, imports)
 }
 
 #[cfg(unix)]
@@ -196,28 +194,16 @@ fn restore_with_imports_strict(
     history: Option<&SessionHistorySnapshot>,
     rows: u16,
     cols: u16,
-    scrollback_limit_bytes: usize,
-    shell_config: crate::pane::PaneShellConfig<'_>,
-    resume_agents_on_restore: bool,
-    ime_control_enabled: bool,
+    runtime_context: &RestoreRuntimeContext<'_>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
-    events: mpsc::Sender<AppEvent>,
-    render_notify: Arc<Notify>,
-    render_dirty: Arc<RenderSignal>,
 ) -> std::io::Result<RestoredSession> {
     let (restored, failed_imports) = restore_with_imports_and_failures(
         snapshot,
         history,
         rows,
         cols,
-        scrollback_limit_bytes,
-        shell_config,
-        resume_agents_on_restore,
-        ime_control_enabled,
+        runtime_context,
         imported_panes,
-        events,
-        render_notify,
-        render_dirty,
     );
     if failed_imports > 0 {
         return Err(std::io::Error::other(format!(
@@ -238,28 +224,16 @@ fn restore_with_imports(
     history: Option<&SessionHistorySnapshot>,
     rows: u16,
     cols: u16,
-    scrollback_limit_bytes: usize,
-    shell_config: crate::pane::PaneShellConfig<'_>,
-    resume_agents_on_restore: bool,
-    ime_control_enabled: bool,
+    runtime_context: &RestoreRuntimeContext<'_>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
-    events: mpsc::Sender<AppEvent>,
-    render_notify: Arc<Notify>,
-    render_dirty: Arc<RenderSignal>,
 ) -> RestoredSession {
     restore_with_imports_and_failures(
         snapshot,
         history,
         rows,
         cols,
-        scrollback_limit_bytes,
-        shell_config,
-        resume_agents_on_restore,
-        ime_control_enabled,
+        runtime_context,
         imported_panes,
-        events,
-        render_notify,
-        render_dirty,
     )
     .0
 }
@@ -269,14 +243,8 @@ fn restore_with_imports_and_failures(
     history: Option<&SessionHistorySnapshot>,
     rows: u16,
     cols: u16,
-    scrollback_limit_bytes: usize,
-    shell_config: crate::pane::PaneShellConfig<'_>,
-    resume_agents_on_restore: bool,
-    ime_control_enabled: bool,
+    runtime_context: &RestoreRuntimeContext<'_>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
-    events: mpsc::Sender<AppEvent>,
-    render_notify: Arc<Notify>,
-    render_dirty: Arc<RenderSignal>,
 ) -> RestoreFailures<RestoredSession> {
     let history = history.filter(|history| {
         let matches = history.layout_fingerprint.is_some()
@@ -292,21 +260,12 @@ fn restore_with_imports_and_failures(
     let mut resumed_agent_sessions = HashSet::new();
     let mut failed_imports = 0;
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
-        let runtime_context = RestoreRuntimeContext {
-            scrollback_limit_bytes,
-            shell_config,
-            ime_control_enabled,
-            resume_agents_on_restore,
-            events: events.clone(),
-            render_notify: render_notify.clone(),
-            render_dirty: render_dirty.clone(),
-        };
         let (restored, workspace_failed_imports) = restore_workspace(
             ws_snap,
             history.and_then(|history| history.workspaces.get(idx)),
             rows,
             cols,
-            &runtime_context,
+            runtime_context,
             &mut resumed_agent_sessions,
             imported_panes,
         );
@@ -1407,12 +1366,14 @@ mod tests {
                 24,
                 80,
                 0,
-                if missing_shell {
-                    "__herdr_missing_restore_shell__"
-                } else {
-                    test_restore_shell()
-                },
-                crate::config::ShellModeConfig::NonLogin,
+                crate::pane::PaneShellConfig::new(
+                    if missing_shell {
+                        "__herdr_missing_restore_shell__"
+                    } else {
+                        test_restore_shell()
+                    },
+                    crate::config::ShellModeConfig::NonLogin,
+                ),
                 false,
                 false,
                 events,
@@ -1514,8 +1475,10 @@ mod tests {
             24,
             80,
             0,
-            test_restore_shell(),
-            crate::config::ShellModeConfig::NonLogin,
+            crate::pane::PaneShellConfig::new(
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+            ),
             false,
             false,
             events,
@@ -1610,8 +1573,10 @@ mod tests {
             24,
             80,
             0,
-            test_restore_shell(),
-            crate::config::ShellModeConfig::NonLogin,
+            crate::pane::PaneShellConfig::new(
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+            ),
             false,
             false,
             events,
@@ -1720,8 +1685,10 @@ mod tests {
             24,
             80,
             0,
-            test_restore_shell(),
-            crate::config::ShellModeConfig::NonLogin,
+            crate::pane::PaneShellConfig::new(
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+            ),
             false,
             false,
             events,
@@ -1833,8 +1800,10 @@ mod tests {
             24,
             80,
             0,
-            test_restore_shell(),
-            crate::config::ShellModeConfig::NonLogin,
+            crate::pane::PaneShellConfig::new(
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+            ),
             true,
             false,
             events,
@@ -1897,8 +1866,10 @@ mod tests {
                 24,
                 80,
                 4096,
-                test_restore_shell(),
-                crate::config::ShellModeConfig::NonLogin,
+                crate::pane::PaneShellConfig::new(
+                    test_restore_shell(),
+                    crate::config::ShellModeConfig::NonLogin,
+                ),
                 false,
                 false,
                 events.clone(),
@@ -2002,8 +1973,10 @@ mod tests {
             5,
             40,
             4096,
-            test_restore_shell(),
-            crate::config::ShellModeConfig::NonLogin,
+            crate::pane::PaneShellConfig::new(
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+            ),
             false,
             false,
             events,
@@ -2041,8 +2014,10 @@ mod tests {
             5,
             40,
             4096,
-            test_restore_shell(),
-            crate::config::ShellModeConfig::NonLogin,
+            crate::pane::PaneShellConfig::new(
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+            ),
             false,
             false,
             events,
@@ -2090,8 +2065,10 @@ mod tests {
                 5,
                 80,
                 4096,
-                test_restore_shell(),
-                crate::config::ShellModeConfig::NonLogin,
+                crate::pane::PaneShellConfig::new(
+                    test_restore_shell(),
+                    crate::config::ShellModeConfig::NonLogin,
+                ),
                 false,
                 false,
                 events,

@@ -7,7 +7,7 @@ use crate::client::ime_control::{
 };
 use crate::client::{ClientError, ClientLoopEvent};
 use crate::raw_input::RawInputEvent;
-use crossterm::event::{KeyEventKind, MouseEventKind};
+use crossterm::event::{KeyEventKind, MouseButton, MouseEventKind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -868,10 +868,22 @@ impl ImeGate {
                     continue;
                 }
             }
-            let urgent = matches!(
-                &event,
-                RawInputEvent::OuterFocusLost | RawInputEvent::OuterFocusGained
-            ) || matches!(&event, RawInputEvent::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Up(button) if shell.pane_mouse_gesture.as_ref().is_some_and(|gesture| gesture.button == button)))
+            // Endpoint chrome is client-owned, not input for the frozen pane.
+            // Keep its selection and balancing release on the native mouse route.
+            let recovery_mouse = frozen
+                && shell.outer_focused != Some(false)
+                && shell.overlay.is_none()
+                && matches!(&event, RawInputEvent::Mouse(mouse) if
+                    (mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                        && shell.endpoint_recovery_hit((mouse.column, mouse.row)))
+                    || (mouse.kind == MouseEventKind::Up(MouseButton::Left)
+                        && shell.workspace_press.is_some()));
+            let urgent = recovery_mouse
+                || matches!(
+                    &event,
+                    RawInputEvent::OuterFocusLost | RawInputEvent::OuterFocusGained
+                )
+                || matches!(&event, RawInputEvent::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Up(button) if shell.pane_mouse_gesture.as_ref().is_some_and(|gesture| gesture.button == button)))
                 || !matches!(
                     &event,
                     RawInputEvent::Key(_)
@@ -1393,6 +1405,97 @@ mod tests {
         for request in outcome.requests {
             let target = registry.active_id().clone();
             registry.send_to(&target, &request);
+        }
+    }
+
+    #[test]
+    fn frozen_ime_input_keeps_local_recovery_controls_without_forwarding_pane_input() {
+        for disconnected in [false, true] {
+            for workspace in [false, true] {
+                let (mut gate, mut shell, mut registry, messages) =
+                    fixture(Some(InputIntentState::Command));
+                let profile = SavedSshEndpoint {
+                    id: ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+                    label: "remote".into(),
+                    target: "dev@example".into(),
+                    session: "fixture".into(),
+                    enabled: true,
+                };
+                let remote = ClientEndpointId::Ssh(profile.id.clone());
+                shell.set_endpoint_catalog(std::slice::from_ref(&profile));
+                let mut snapshot = super::super::tests::snapshot();
+                snapshot.boot_id = "remote-boot".into();
+                snapshot.panes[0].terminal_id = Some("remote-terminal".into());
+                snapshot.input_intents = Some(Arc::from([]));
+                shell.set_endpoint_snapshot_for_generation(&remote, 7, Box::new(snapshot));
+                shell.set_endpoint_status(&remote, ClientEndpointStatus::Online);
+                let (remote_sender, remote_messages) = mpsc::channel();
+                registry.insert(
+                    remote.clone(),
+                    RecordingTransport(remote_sender),
+                    7,
+                    negotiation(),
+                    true,
+                );
+                if disconnected {
+                    assert!(shell.activate_endpoint_projection(&remote));
+                    assert!(registry.set_active(&remote));
+                    shell.mark_endpoint_disconnected(&remote);
+                    registry.set_surface_active(&remote, false);
+                } else {
+                    let mut pending = ClientShellInput::default();
+                    assert!(shell.activate_endpoint(remote, &mut pending));
+                }
+                shell.compose(100, 28).unwrap();
+                let rect = if workspace {
+                    shell
+                        .hits
+                        .workspaces
+                        .iter()
+                        .find(|hit| hit.endpoint_id.is_local())
+                        .unwrap()
+                        .rect
+                } else {
+                    shell
+                        .hits
+                        .machines
+                        .iter()
+                        .find(|hit| hit.endpoint_id.is_local())
+                        .unwrap()
+                        .rect
+                };
+                let raw = format!(
+                    "\x1b[<0;{};{}M\x1b[<0;{};{}mignored",
+                    rect.x + 6,
+                    rect.y + 1,
+                    rect.x + 6,
+                    rect.y + 1,
+                )
+                .into_bytes();
+                let events = crate::raw_input::parse_raw_input_bytes_sync(&raw);
+                let outcome = gate
+                    .enqueue(
+                        &mut shell,
+                        &registry,
+                        raw,
+                        events,
+                        None,
+                        !disconnected,
+                        Instant::now(),
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(outcome.actions.as_slice(), [ClientShellAction::ActivateEndpoint {
+                        endpoint_id: ClientEndpointId::Local, target,
+                    }] if target.is_some() == workspace),
+                    "Local recovery discarded: disconnected={disconnected}, workspace={workspace}"
+                );
+                assert!(outcome.requests.is_empty());
+                assert!(outcome.routed_requests.is_empty());
+                assert!(messages.try_recv().is_err());
+                assert!(remote_messages.try_recv().is_err());
+                assert!(gate.batches.is_empty());
+            }
         }
     }
 

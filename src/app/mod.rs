@@ -390,8 +390,10 @@ impl App {
                 24,
                 80,
                 config.advanced.scrollback_limit_bytes,
-                &config.terminal.default_shell,
-                config.terminal.shell_mode,
+                crate::pane::PaneShellConfig::new(
+                    &config.terminal.default_shell,
+                    config.terminal.shell_mode,
+                ),
                 config.session.resume_agents_on_restore,
                 ime_control_enabled,
                 event_tx.clone(),

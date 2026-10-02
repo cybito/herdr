@@ -207,7 +207,7 @@ fn unsupported_ime_endpoint_activation_preserves_healthy_local_input() {
         .shell
         .as_mut()
         .unwrap()
-        .set_endpoint_catalog(&[profile.clone()]);
+        .set_endpoint_catalog(std::slice::from_ref(&profile));
     state
         .shell
         .as_mut()

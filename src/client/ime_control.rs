@@ -1588,7 +1588,7 @@ mod tests {
             &a,
             Some(InputIntentState::Command),
             InputIntentPolicy::Mode,
-            &[a.clone()],
+            std::slice::from_ref(&a),
             1,
         );
         short.deadline = Instant::now() + Duration::from_millis(500);
@@ -1606,7 +1606,7 @@ mod tests {
                 &a,
                 Some(InputIntentState::Command),
                 InputIntentPolicy::Mode,
-                &[a.clone()],
+                std::slice::from_ref(&a),
                 2,
             ))
             .unwrap();
@@ -1629,7 +1629,7 @@ mod tests {
                 &old,
                 Some(InputIntentState::Command),
                 InputIntentPolicy::Mode,
-                &[old.clone()],
+                std::slice::from_ref(&old),
                 1,
             ))
             .unwrap();
@@ -1643,7 +1643,7 @@ mod tests {
                 &new,
                 Some(InputIntentState::Command),
                 InputIntentPolicy::Mode,
-                &[new.clone()],
+                std::slice::from_ref(&new),
                 2,
             ))
             .unwrap();
@@ -1709,7 +1709,7 @@ mod tests {
             &child,
             Some(InputIntentState::Text),
             InputIntentPolicy::Mode,
-            &[child.clone()],
+            std::slice::from_ref(&child),
             3,
         );
         update.start_episode = false;

@@ -1,6 +1,18 @@
 use super::*;
 
 impl ClientShellState {
+    pub(super) fn endpoint_recovery_hit(&self, point: (u16, u16)) -> bool {
+        self.hits
+            .machines
+            .iter()
+            .any(|hit| super::contains(hit.rect, point))
+            || self
+                .hits
+                .workspaces
+                .iter()
+                .any(|hit| super::contains(hit.rect, point))
+    }
+
     pub(super) fn active_endpoint_workspace_at(&self, point: (u16, u16)) -> Option<String> {
         self.hits
             .workspaces
