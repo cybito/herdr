@@ -545,11 +545,14 @@ impl ClientShellState {
             .filter(|endpoint| endpoint.snapshot_generation == Some(generation))
             .and_then(|endpoint| endpoint.snapshot.as_deref());
         if !current.is_some_and(|snapshot| {
+            // Native activation can commit a coherent frame before metadata-only updates.
+            // Keep focus on that connection's frame; its current roster may be newer.
             snapshot.input_intents.is_some()
                 && self.snapshot.as_deref().is_some_and(|projected| {
                     &self.active_endpoint_id == endpoint_id
+                        && self.active_snapshot_generation == Some(generation)
                         && projected.boot_id == snapshot.boot_id
-                        && projected.revision == snapshot.revision
+                        && projected.revision <= snapshot.revision
                 })
         }) {
             return Err(crate::client::ClientError::InputIntentProtocolError);

@@ -596,7 +596,7 @@ ime_control = true
 
 server 的 `scope:recorded` ACK 只表示意图已保存。聚焦 client 将该意图映射到本机 `ime-control` lease；命令输入等待匹配当前 endpoint、terminal/app generation 与 focus episode 的 `scope:applied` ACK。text 只释放暂态英文，不强制选择中文。失焦、应用退出、terminal 关闭、断开／重连或 endpoint 切换时释放；无 reporter 的 shell 与 Popup 不借用其他 pane 的输入源。native 父程序在 child 返回或 SIGCONT 后保持 inactive，下一个真实 key/FocusIn 才按当前模式恢复。
 
-连接未就绪或投影尚不连贯时，新语义输入以 `IME_INPUT_CANCELLED` 明确取消，不跨连接缓存／重放；已发送 key release 仍独立处理。快照 revision 仅在 connection generation 内排序：同一 boot 的重连允许低 revision，旧投影在 surface 完成交接后才由新连接快照替换。当前连接缺失完整 roster 仍为 `IME_INTENT_PROTOCOL_ERROR`，不视为兼容空值。
+连接未就绪或投影尚不连贯时，新语义输入以 `IME_INPUT_CANCELLED` 明确取消，不跨连接缓存／重放；已发送 key release 仍独立处理。快照 revision 仅在 connection generation 内排序：同一 boot 的重连允许低 revision，旧投影在 surface 完成交接后才由新连接快照替换。焦点仍取已提交画面，必须匹配当前 connection generation 与 boot；同连接的完整 reporter roster 可以比画面更新，但不能比画面更旧，不因 metadata-only 更新等待不存在的新画面。当前连接缺失完整 roster 仍为 `IME_INTENT_PROTOCOL_ERROR`，不视为兼容空值。
 
 client FIFO 门禁限 256 batches、2MiB、5s；失败明确拒绝，已发送按键的 release 仍走原 route，不等待新 ACK。网络收到意图前或外层 IME 已消费的首字符无法由此保护。Linux client 还要求独立、可信的 Hyprland foreground observer，不能用 daemon 存活或 reporter 的 FocusLost 代替真实图形焦点。
 

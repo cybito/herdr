@@ -1388,6 +1388,50 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn newer_metadata_keeps_committed_focus_input_authorizable_after_activation() {
+        use crate::protocol::{ClientKeyCode, ClientKeyKind};
+        let (mut gate, mut shell, mut registry, messages) =
+            fixture(Some(InputIntentState::Command));
+        let now = Instant::now();
+        let mut metadata = shell.snapshot.as_ref().unwrap().as_ref().clone();
+        metadata.revision += 1;
+        shell.cache_endpoint_snapshot_for_generation(
+            &ClientEndpointId::Local,
+            1,
+            Box::new(metadata),
+        );
+        enqueue(&mut gate, &mut shell, &registry, b"j", now);
+        assert!(dispatch(&mut gate, &mut shell, &mut registry, now).is_none());
+        assert!(matches!(
+            messages.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        applied(&mut gate);
+        let outcome = dispatch(&mut gate, &mut shell, &mut registry, now)
+            .expect("coherent committed focus must accept input after its exact applied ACK");
+        send(&shell, &mut registry, outcome);
+        let forwarded: Vec<_> = messages
+            .try_iter()
+            .flat_map(|message| match message {
+                ClientMessage::ClientShellPaneInput { pane_id, events } => {
+                    assert_eq!(pane_id, "pane_1");
+                    events
+                }
+                message => panic!("unexpected input message: {message:?}"),
+            })
+            .collect();
+        assert!(matches!(
+            forwarded.as_slice(),
+            [ClientPaneInputEvent::Key {
+                code: ClientKeyCode::Char('j'),
+                modifiers: 0,
+                kind: ClientKeyKind::Press,
+                ..
+            }]
+        ));
+    }
+
     pub(super) fn dispatch(
         gate: &mut ImeGate,
         shell: &mut ClientShellState,

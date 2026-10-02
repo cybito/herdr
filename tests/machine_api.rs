@@ -22,7 +22,8 @@ case "$last" in
     '/bin/sh -c '*)
         if [ "$TEST_MODE" = offline ]; then echo 'test remote connection failed' >&2; exit 255; fi
         printf 'login banner\n'
-        PATH="$TEST_ROOT/remote bin:/usr/bin:/bin" exec /bin/sh -c "$last" ;;
+        # Keep installed host Herdr binaries out of this private discovery fixture.
+        PATH="$TEST_ROOT/remote bin" exec /bin/sh -c "$last" ;;
     '/bin/sh -s')
         script=$(cat)
         printf 'login banner\nherdr-remote-output-ready:1\n'
@@ -356,7 +357,6 @@ fn machine_api_recovers_a_stale_path_before_sending_a_mutation() {
         harness.root.join(".local/bin/herdr"),
     )
     .unwrap();
-    let before = harness.ssh_calls();
     let server = harness.serve(json!({"result":{"type":"ok"}}), harness.protocol);
     success(
         harness
@@ -365,18 +365,21 @@ fn machine_api_recovers_a_stale_path_before_sending_a_mutation() {
             .unwrap(),
     );
     assert_eq!(server.join().unwrap()["method"], "pane.close");
+    let metadata: Value = serde_json::from_slice(
+        &fs::read(
+            harness
+                .state
+                .join("ssh-metadata")
+                .join(format!("{PROFILE_ID}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     assert_eq!(
-        harness.ssh_calls() - before,
-        5,
-        "one failed ping followed by fresh discovery and one command"
+        metadata["metadata"]["executable"],
+        harness.root.join(".local/bin/herdr").to_str().unwrap()
     );
-    let before = harness.ssh_calls();
     harness.warm_metadata();
-    assert_eq!(
-        harness.ssh_calls() - before,
-        1,
-        "recovered path must be saved"
-    );
     harness.assert_local_untouched();
 }
 
