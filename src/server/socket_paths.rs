@@ -61,6 +61,11 @@ pub(crate) fn derive_client_socket_from_api_socket(api_socket_path: &Path) -> Pa
 /// removes stale socket files where no server is listening, and rejects live
 /// sockets that are already in use.
 pub(crate) fn prepare_socket_path(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if parent == crate::session::data_dir() {
+            crate::platform::prepare_session_directory(parent)?;
+        }
+    }
     crate::ipc::prepare_socket_path(path, |path| {
         format!(
             "herdr server is already running (socket busy at {})",

@@ -600,7 +600,11 @@ server 的 `scope:recorded` ACK 只表示意图已保存。聚焦 client 将该�
 
 client FIFO 门禁限 256 batches、2MiB、5s；失败明确拒绝，已发送按键的 release 仍走原 route，不等待新 ACK。网络收到意图前或外层 IME 已消费的首字符无法由此保护。Linux client 还要求独立、可信的 Hyprland foreground observer，不能用 daemon 存活或 reporter 的 FocusLost 代替真实图形焦点。
 
-开启该路径时 prefix 使用同一 daemon，不同时运行旧 `switch_ascii_input_source_in_prefix` direct-switch；关闭时旧行为不变。private bincode protocol 为 23，endpoint 协议 generation 仍为 1，能力另行协商；不支持的背景 endpoint 进入 Attention，不影响健康 Local。该候选尚未替换已安装程序；隔离 PTY/模拟 compositor 验证不等于真实 GUI 输入法验收。
+Unix 会话目录以 `0700` 创建；已有的当前用户所有、无外部写入权限且可读写的目录会安全收窄为 `0700`，保留目录身份和会话数据。路径须为绝对规范路径，拒绝用户可替换的目录符号链接；仅允许只读 root 所有父目录中的 root 所有系统祖先别名，并逐组件验证解析目标。外部可写、非当前用户所有或只读的会话目录会被拒绝，不自动接管；这不放宽本机 IME guard 的 socket 信任规则。
+
+`--session` 选择独立的命名会话目录，并覆盖 socket 环境变量指定的路径。隔离测试应设置私有、简短的 `XDG_CONFIG_HOME`；完整运行时隔离还需设置私有 `HOME` 和其他 XDG 目录。仅覆盖 socket 环境变量不能隔离命名会话，过长路径会超过 Unix socket 长度限制。
+
+开启该路径时 prefix 使用同一 daemon，不同时运行旧 `switch_ascii_input_source_in_prefix` direct-switch；关闭时旧行为不变。private bincode protocol 为 23，endpoint 协议 generation 仍为 1，能力另行协商；不支持的背景 endpoint 进入 Attention，不影响健康 Local。隔离 PTY/模拟 compositor 验证不等于真实 GUI 输入法验收。
 
 ## 环境变量
 

@@ -267,6 +267,11 @@ fn method_specific_request_error(line: &str, id: &str) -> Option<ErrorResponse> 
 }
 
 fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if parent == crate::session::data_dir() {
+            crate::platform::prepare_session_directory(parent)?;
+        }
+    }
     crate::ipc::prepare_socket_path(path, |path| {
         format!(
             "herdr is already running (socket busy at {})",
@@ -1158,11 +1163,12 @@ fn error_response_json(id: String, code: &str, message: String) -> String {
 mod tests {
     use super::*;
     use interprocess::local_socket::traits::Listener as _;
+    use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Read};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
     use tokio::sync::mpsc;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -1304,7 +1310,7 @@ mod tests {
 
     #[test]
     fn socket_path_prefers_explicit_env_override() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         let unique = format!("/tmp/herdr-test-{}.sock", std::process::id());
         std::env::remove_var(crate::session::SESSION_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
@@ -1315,7 +1321,7 @@ mod tests {
 
     #[test]
     fn socket_path_defaults_to_config_dir_even_when_xdg_runtime_dir_is_set() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         let config_home = unique_test_path("socket-default-config-home");
         let runtime_dir = unique_test_path("socket-default-runtime");
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
@@ -1335,7 +1341,7 @@ mod tests {
 
     #[test]
     fn socket_path_uses_named_session_dir() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         let config_home = unique_test_path("socket-named-config-home");
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
@@ -1351,6 +1357,32 @@ mod tests {
 
         std::env::remove_var(crate::session::SESSION_ENV_VAR);
         std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn prepare_socket_path_creates_private_named_session_directory() {
+        let _guard = env_lock().lock();
+        let config_home = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("herdr-private-session-{}", std::process::id()));
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        crate::session::clear_explicit_session_for_test();
+        std::env::set_var(crate::session::SESSION_ENV_VAR, "work");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        let path = socket_path();
+
+        prepare_socket_path(&path).unwrap();
+        let mode = fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        fs::remove_dir_all(&config_home).unwrap();
+        assert_eq!(mode, 0o700);
     }
 
     #[test]

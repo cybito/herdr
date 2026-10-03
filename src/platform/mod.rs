@@ -334,6 +334,16 @@ pub(crate) use unix_common::{
     begin_cli_output, end_cli_output, forward_remote_bridge_stdio, RemoteBridgeWake,
 };
 
+#[cfg(unix)]
+mod unix_session_directory;
+#[cfg(unix)]
+pub(crate) use unix_session_directory::prepare_session_directory;
+
+#[cfg(not(unix))]
+pub(crate) fn prepare_session_directory(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
 mod client_state;
 pub(crate) use client_state::{create_private_state_file, replace_file, sync_parent_directory};
 
