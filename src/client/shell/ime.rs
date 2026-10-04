@@ -586,6 +586,9 @@ impl ImeGate {
                         .as_ref()
                         .is_some_and(crate::selection::Selection::is_visible)
             }
+            // Pure hover is not a command trigger, even over chrome or another pane.
+            // Keep the current terminal intent and the normal applied-ACK gate.
+            Some(RawInputEvent::Mouse(mouse)) if mouse.kind == MouseEventKind::Moved => false,
             // Chrome mouse actions are Herdr commands; forwarded mouse traffic uses the
             // current terminal intent. A click on a different pane is staged below.
             Some(RawInputEvent::Mouse(mouse))
@@ -2321,6 +2324,139 @@ mod tests {
             ClientMessage::ClientShellPaneInput { .. }
                 | ClientMessage::ClientShellPopupInput { .. }
         )));
+    }
+
+    #[test]
+    fn text_pane_hover_keeps_reporter_intent_over_tabs_chrome_and_other_panes() {
+        for target in 0..4 {
+            let (mut gate, mut shell, mut registry, messages) =
+                fixture(Some(InputIntentState::Text));
+            two_panes(&mut shell, false);
+            let mut snapshot = shell.snapshot.as_ref().unwrap().as_ref().clone();
+            snapshot.revision += 1;
+            let mut roster = snapshot.input_intents.as_ref().unwrap().to_vec();
+            roster[0].sessions[0].state = InputIntentState::Text;
+            snapshot.input_intents = Some(roster.into());
+            let revision = snapshot.revision;
+            shell.set_endpoint_snapshot_for_generation(
+                &ClientEndpointId::Local,
+                1,
+                Box::new(snapshot),
+            );
+            let mut surface = shell.pane_surface.as_ref().unwrap().clone();
+            surface.projection_revision = revision;
+            surface.surface_revision = revision;
+            shell.set_pane_surface(surface);
+            shell.compose(100, 28).unwrap();
+            let rect = match target {
+                0 => shell.hits.tabs[0].0,
+                1 => shell.hits.new_tab,
+                2 => shell.hits.panes[0].inner_rect,
+                _ => shell.hits.panes[1].inner_rect,
+            };
+            assert!(rect.width > 0 && rect.height > 0);
+            let now = Instant::now();
+            gate.enqueue(
+                &mut shell,
+                &registry,
+                Vec::new(),
+                vec![RawInputEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: rect.x,
+                    row: rect.y,
+                    modifiers: KeyModifiers::NONE,
+                })],
+                None,
+                false,
+                now,
+            )
+            .unwrap();
+            let desired = gate.desired.as_ref().unwrap();
+            assert_eq!(
+                desired.state,
+                InputIntentState::Text,
+                "hover target {target}"
+            );
+            assert_eq!(
+                desired.identity.reporter_session.as_deref(),
+                Some("reporter-a"),
+                "hover target {target}"
+            );
+            assert_eq!(
+                desired.identity.terminal_target,
+                LeaseTarget::Terminal(Arc::from("terminal-1"))
+            );
+            assert!(dispatch(&mut gate, &mut shell, &mut registry, now).is_none());
+            assert!(messages.try_iter().next().is_none());
+            assert!(shell.tab_press.is_none());
+            applied(&mut gate);
+            let outcome = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+            assert!(outcome.actions.is_empty());
+            assert!(outcome.requests.is_empty());
+            if target < 2 {
+                assert!(outcome.routed_requests.is_empty());
+            } else {
+                assert!(
+                    matches!(outcome.routed_requests.as_slice(), [(_, ClientMessage::ClientShellPaneInput { pane_id, events })]
+                        if pane_id == if target == 2 { "pane_1" } else { "pane_2" }
+                            && matches!(events.as_slice(), [ClientPaneInputEvent::Mouse { .. }]))
+                );
+            }
+            send(&shell, &mut registry, outcome);
+            let received: Vec<_> = messages.try_iter().collect();
+            if target == 2 {
+                assert!(matches!(received.as_slice(),
+                    [ClientMessage::ClientShellPaneInput { pane_id, events }]
+                        if pane_id == "pane_1"
+                            && matches!(events.as_slice(), [ClientPaneInputEvent::Mouse {
+                                kind: crate::protocol::ClientMouseKind::Moved, ..
+                            }])
+                ));
+            } else {
+                // Chrome produces no pane input; the route identity rejects
+                // hover delivery to a different, unfocused terminal.
+                assert!(received.is_empty(), "hover target {target}");
+            }
+            assert!(dispatch(&mut gate, &mut shell, &mut registry, now).is_none());
+            assert_eq!(gate.desired.as_ref().unwrap().state, InputIntentState::Text);
+            assert_eq!(shell.focused_pane_id().as_deref(), Some("pane_1"));
+            assert!(shell.tab_press.is_none());
+        }
+    }
+
+    #[test]
+    fn text_pane_tab_click_still_requires_command_applied_ack() {
+        let (mut gate, mut shell, mut registry, messages) = fixture(Some(InputIntentState::Text));
+        shell.compose(100, 28).unwrap();
+        let rect = shell.hits.tabs[0].0;
+        assert!(rect.width > 0 && rect.height > 0);
+        let now = Instant::now();
+        gate.enqueue(
+            &mut shell,
+            &registry,
+            Vec::new(),
+            vec![RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            })],
+            None,
+            false,
+            now,
+        )
+        .unwrap();
+        let desired = gate.desired.as_ref().unwrap();
+        assert_eq!(desired.state, InputIntentState::Command);
+        assert_eq!(desired.identity.terminal_target, LeaseTarget::LocalUi);
+        assert!(dispatch(&mut gate, &mut shell, &mut registry, now).is_none());
+        assert!(shell.tab_press.is_none());
+        assert!(messages.try_iter().next().is_none());
+        applied(&mut gate);
+        let outcome = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+        assert!(shell.tab_press.is_some());
+        assert!(outcome.routed_requests.is_empty());
+        assert!(dispatch(&mut gate, &mut shell, &mut registry, now).is_none());
     }
 
     #[test]
