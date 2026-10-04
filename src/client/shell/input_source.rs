@@ -23,7 +23,7 @@ impl ClientShellState {
     }
 
     pub(crate) fn reconcile_input_source(&mut self) {
-        if self.ime_control_enabled {
+        if self.ime_control_requested {
             return;
         }
         // Keep the platform restore token while another window has focus. Restoring

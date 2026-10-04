@@ -357,9 +357,9 @@ fn handshake_error(error: crate::client::ClientError) -> std::io::Error {
         error @ ClientError::InputIntentProtocolError => {
             std::io::Error::new(std::io::ErrorKind::InvalidData, error)
         }
-        error @ (ClientError::ImeControl(_)
-        | ClientError::ImeInputOverflow
-        | ClientError::ImeAckTimeout) => std::io::Error::other(error),
+        error @ (ClientError::ImeControl(_) | ClientError::ImeAckTimeout) => {
+            std::io::Error::other(error)
+        }
         ClientError::ServerShutdown { reason } => std::io::Error::new(
             std::io::ErrorKind::ConnectionAborted,
             reason.unwrap_or_else(|| "server shut down during handshake".into()),

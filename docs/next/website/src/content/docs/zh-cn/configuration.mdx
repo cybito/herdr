@@ -592,23 +592,25 @@ switch_ascii_input_source_in_prefix = true
 ime_control = true
 ```
 
-应用通过既有 Unix API 的 `pane.input_intent.stream` 报告自身 `command`/`text` 与生命周期。pane 使用 `HERDR_PANE_ID`，Popup 使用唯一 `HERDR_IME_POPUP_TERMINAL_ID`；`HERDR_IME_INTENT=1` 与 `HERDR_ENV=1` 先于 SSH/图形会话判断选择此 transport。缺失或矛盾 identity 明确失败，不猜 focused pane，也不使用 server 主机输入法。无 marker 时应用保留原有本地／SSH 行为。
+应用通过既有 Unix API 的 `pane.input_intent.stream` 报告自身 `command`/`text` 与生命周期。pane 使用 `HERDR_PANE_ID`，Popup 使用唯一 `HERDR_IME_POPUP_TERMINAL_ID`；`HERDR_IME_INTENT=1` 与 `HERDR_ENV=1` 先于 SSH/图形会话判断选择此 transport。缺失或矛盾 identity 只静默关闭该进程的 IME 增强，不猜 focused pane，也不回退到本机或 server 主机输入法。无 marker 时应用保留原有本地／SSH 行为。
 
 server 的 `scope:recorded` ACK 只表示意图已保存。聚焦 client 将该意图映射到本机 `ime-control` lease；命令输入等待匹配当前 endpoint、terminal/app generation 与 focus episode 的 `scope:applied` ACK。text 只释放暂态英文，不强制选择中文。失焦、应用退出、terminal 关闭、断开／重连或 endpoint 切换时释放；无 reporter 的 shell 与 Popup 不借用其他 pane 的输入源。native 父程序在 child 返回或 SIGCONT 后保持 inactive，下一个真实 key/FocusIn 才按当前模式恢复。
 
-连接未就绪或投影尚不连贯时，新语义输入以 `IME_INPUT_CANCELLED` 明确取消，不跨连接缓存／重放；已发送 key release 仍独立处理。快照 revision 仅在 connection generation 内排序：同一 boot 的重连允许低 revision，旧投影在 surface 完成交接后才由新连接快照替换。焦点仍取已提交画面，必须匹配当前 connection generation 与 boot；同连接的完整 reporter roster 可以比画面更新，但不能比画面更旧，不因 metadata-only 更新等待不存在的新画面。当前连接缺失完整 roster 仍为 `IME_INTENT_PROTOCOL_ERROR`，不视为兼容空值。
+连接未就绪或投影尚不连贯时，新语义输入仍受既有焦点／连接边界约束，不跨连接缓存／重放；已发送 key release 仍独立处理。快照 revision 仅在 connection generation 内排序：同一 boot 的重连允许低 revision，旧投影在 surface 完成交接后才由新连接快照替换。焦点仍取已提交画面，必须匹配当前 connection generation 与 boot；同连接的完整 reporter roster 可以比画面更新，但不能比画面更旧，不因 metadata-only 更新等待不存在的新画面。缺失或无效的当前 roster 不被伪造成空值或 `applied`，只关闭当前客户端的 IME 增强，保留普通终端输入和端点连接。
 
-启用本机 IME 的 Popup 命令使用单独协商的 `command.invoke_receipt`，成功返回 `command_invoked` 与精确的 `popup_terminal_id`；不支持该方法的 endpoint 在发送前明确拒绝，不回退到无身份回执。原 `command.invoke` 的 `ok` 响应及未启用 IME 的命令行为保持不变。
+正常 IME 增强的 Popup 命令使用单独协商的 `command.invoke_receipt`，成功返回 `command_invoked` 与精确的 `popup_terminal_id`。该能力不可用或本机增强已经退化时，关闭本进程的 IME 增强并使用普通 `command.invoke`；尚未发送的当前 Popup 请求保留 request ID、endpoint、boot 和原始 target 参数，仅切换为普通方法。已经发送的请求不会重发或改写。普通方法的 `ok` 不是输入源授权，也不能延续 IME episode。
 
 本地 Popup 的当前请求、成功回执、实际 terminal 和父 route 必须相符，才能延续当前真实输入 episode；不能把最先出现的 Popup 投影当成本地请求的结果。这个身份记录不是切源权限：失焦或 inactive ACK 撤销当前权限，metadata、失败／取消回执与外来 Popup 都不能重新建立 episode。同一存活 Popup 经真实 key/FocusIn 建立新 episode 后，返回仍 active 的精确父 terminal 也须重新采样并等待新 ACK；旧 Popup ACK 不授权父 terminal。
 
-client FIFO 门禁限 256 batches、2MiB、5s；失败明确拒绝，已发送按键的 release 仍走原 route，不等待新 ACK。网络收到意图前或外层 IME 已消费的首字符无法由此保护。Linux client 还要求独立、可信的 Hyprland foreground observer，不能用 daemon 存活或 reporter 的 FocusLost 代替真实图形焦点。
+本机图形会话、daemon、socket、后端、foreground observer、worker 或当前 ACK 不可用时，客户端静默退化为普通终端。IME FIFO 门禁限 256 batches、2MiB、5s；达到边界时也只关闭增强，当前与排队的未发送输入继续派发，保留已消费的事件游标与待发命令，不重放 prefix 或鼠标焦点动作。已发送按键／鼠标的 release 仍走原 route，不等待新 ACK；正常焦点、terminal 和 connection generation 边界仍防止错误目标派发。失败清除本机源授权、关闭 stream，不重试旧模式，不伪造 `applied` 或英文保护，不弹出 IME 通知。网络收到意图前或外层 IME 已消费的首字符无法由此保护。正常 Linux 增强仍要求独立、可信的 Hyprland foreground observer，不能用 daemon 存活或 reporter 的 FocusLost 代替真实图形焦点。
+
+已派发的鼠标 `pane.focus` 用实际 request ID 跟踪结果；Generic 拒绝／超时结束 IME 等待，成功 ACK 仍须真实焦点投影，投影或响应缺失最多等待该 batch 原始 5 秒截止时间。退化后也保留此截止时间，不因关闭 IME 变成无限等待。失败后原 click 的 down/drag/up 按普通输入继续，已开始手势的 drag/up 保留捕获的 route，已发送的 focus proposal 不重发；仍在原 route 捕获的键不会跟随 click 投往新 pane，后续普通输入、导航与分离不会被 IME FIFO 卡住。可见但未聚焦的 pane 缺少 `terminal_id` 时也只关闭增强；普通输入 route 保留 endpoint／generation／boot／pane 与缺失身份的真实 `None`，不创建 IME lease 或伪造 `applied`。
 
 Unix 会话目录以 `0700` 创建；已有的当前用户所有、无外部写入权限且可读写的目录会安全收窄为 `0700`，保留目录身份和会话数据。路径须为绝对规范路径，拒绝用户可替换的目录符号链接；仅允许只读 root 所有父目录中的 root 所有系统祖先别名，并逐组件验证解析目标。外部可写、非当前用户所有或只读的会话目录会被拒绝，不自动接管；这不放宽本机 IME guard 的 socket 信任规则。
 
 `--session` 选择独立的命名会话目录，并覆盖 socket 环境变量指定的路径。隔离测试应设置私有、简短的 `XDG_CONFIG_HOME`；完整运行时隔离还需设置私有 `HOME` 和其他 XDG 目录。仅覆盖 socket 环境变量不能隔离命名会话，过长路径会超过 Unix socket 长度限制。
 
-开启该路径时 prefix 使用同一 daemon，不同时运行旧 `switch_ascii_input_source_in_prefix` direct-switch；关闭时旧行为不变。private bincode protocol 为 23，endpoint 协议 generation 仍为 1，能力另行协商；不支持的背景 endpoint 进入 Attention，不影响健康 Local。隔离 PTY/模拟 compositor 验证不等于真实 GUI 输入法验收。
+开启该路径时 prefix 使用同一 daemon，不同时运行旧 `switch_ascii_input_source_in_prefix` direct-switch；本进程退化后也不会重新启用该旧后端。显式关闭实验配置时旧行为不变。private bincode protocol 为 23，endpoint 协议 generation 仍为 1，能力另行协商；缺少可选 IME 能力不会使 endpoint 进入 Attention 或影响健康连接。隔离 PTY/模拟 compositor 验证不等于真实 GUI 输入法验收。
 
 ## 环境变量
 

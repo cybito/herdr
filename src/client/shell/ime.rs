@@ -30,6 +30,11 @@ struct LocalPopup {
     terminal: Option<Arc<str>>,
 }
 
+struct MouseFocusTarget {
+    terminal: Arc<str>,
+    request_id: Arc<str>,
+}
+
 struct InputBatch {
     // Retain the original allocation for image-paste/file-drop recognition. Events move
     // out of their parser allocation; advancing never reparses or replays a trigger.
@@ -38,7 +43,8 @@ struct InputBatch {
     cursor: usize,
     image_checked: bool,
     forward_prefix: bool,
-    focus_target: Option<(String, Arc<str>)>,
+    focus_target: Option<MouseFocusTarget>,
+    focus_requested: bool,
     pending_outcome: Option<ClientShellInput>,
     replay: bool,
     pixels: Option<crate::input::mouse::HostPixels>,
@@ -58,6 +64,7 @@ struct CachedEndpoint {
 /// module owns causal keys, replacement-roster identity caching, and the FIFO.
 pub(in crate::client) struct ImeGate {
     worker: Option<ImeWorker>,
+    disabled: bool,
     cache: Vec<CachedEndpoint>,
     live: Arc<[Arc<LeaseIdentity>]>,
     batches: VecDeque<InputBatch>,
@@ -94,16 +101,21 @@ impl Drop for ImeGate {
 }
 
 impl ImeGate {
-    pub(in crate::client) fn start(
-        sender: tokio::sync::mpsc::Sender<ClientLoopEvent>,
-    ) -> Result<Self, ClientError> {
-        let worker = ImeWorker::start(sender).map_err(ClientError::ImeControl)?;
-        Ok(Self::with_worker(Some(worker)))
+    pub(in crate::client) fn start(sender: tokio::sync::mpsc::Sender<ClientLoopEvent>) -> Self {
+        match ImeWorker::start(sender) {
+            Ok(worker) => Self::with_worker(Some(worker)),
+            Err(_) => {
+                let mut gate = Self::with_worker(None);
+                gate.disable();
+                gate
+            }
+        }
     }
 
     fn with_worker(worker: Option<ImeWorker>) -> Self {
         Self {
             worker,
+            disabled: false,
             cache: Vec::new(),
             live: Arc::from([]),
             batches: VecDeque::new(),
@@ -141,7 +153,7 @@ impl ImeGate {
     pub(in crate::client) fn ready(&self) -> bool {
         !self.pending_releases.routed_requests.is_empty()
             || self.release_ready
-            || (self.applied
+            || ((self.applied || self.disabled)
                 && !self.waiting_target
                 && self
                     .batches
@@ -150,7 +162,10 @@ impl ImeGate {
     }
 
     pub(in crate::client) fn deadline(&self) -> Option<Instant> {
-        self.batches.front().map(|batch| batch.deadline)
+        self.batches
+            .front()
+            .filter(|batch| !self.disabled || batch.focus_target.is_some())
+            .map(|batch| batch.deadline)
     }
 
     pub(in crate::client) fn take_releases(&mut self) -> Option<ClientShellInput> {
@@ -166,8 +181,27 @@ impl ImeGate {
         self.applied && self.focused && self.binding.is_some()
     }
 
+    pub(in crate::client) fn enabled(&self) -> bool {
+        !self.disabled
+    }
+
+    pub(in crate::client) fn disable(&mut self) {
+        self.disabled = true;
+        // Dropping the worker closes its streams; no retry or old-mode replay.
+        self.worker = None;
+        self.authorization = None;
+        self.desired = None;
+        self.pending_plan = None;
+        self.applied = false;
+        self.inactive = false;
+        self.submitted = false;
+        self.sample_pending = false;
+        self.episode = false;
+        self.local_popup = None;
+    }
+
     fn report_cancelled(&mut self, shell: &mut ClientShellState, count: usize) {
-        if count != 0 {
+        if count != 0 && !self.disabled {
             shell.endpoint_error = Some(format!(
                 "IME_INPUT_CANCELLED: {count} waiting input batches cancelled"
             ));
@@ -211,6 +245,7 @@ impl ImeGate {
             }
         }
         self.bytes = 0;
+        shell.mouse_focus_request = None;
         shell.ime_forward_prefix = false;
         self.report_cancelled(shell, count);
     }
@@ -522,7 +557,7 @@ impl ImeGate {
                 && batch
                     .focus_target
                     .as_ref()
-                    .is_some_and(|(_, terminal)| binding.terminal.as_ref() == Some(terminal))
+                    .is_some_and(|target| binding.terminal.as_ref() == Some(&target.terminal))
         });
         if !expected {
             return false;
@@ -563,10 +598,73 @@ impl ImeGate {
         }
         continuation.binding = binding.clone();
         continuation.focus_target = None;
+        shell.mouse_focus_request = None;
         self.bytes = continuation.raw.len();
         self.batches.push_back(continuation);
         self.report_cancelled(shell, cancelled);
         true
+    }
+
+    fn mouse_focus_wait_finished(&self, shell: &ClientShellState, now: Instant) -> bool {
+        self.batches.front().is_some_and(|batch| {
+            batch.focus_target.as_ref().is_some_and(|target| {
+                now >= batch.deadline
+                    || shell
+                        .mouse_focus_request
+                        .as_ref()
+                        .is_some_and(|(request_id, failed)| {
+                            request_id == &target.request_id && *failed
+                        })
+            })
+        })
+    }
+
+    fn plain_mouse_route(
+        &self,
+        shell: &ClientShellState,
+        event: &RawInputEvent,
+    ) -> Option<Arc<ClientInputRoute>> {
+        if !self.disabled
+            || shell.overlay.is_some()
+            || shell.popup_pending
+            || shell.popup_terminal_id.is_some()
+        {
+            return None;
+        }
+        let RawInputEvent::Mouse(mouse) = event else {
+            return None;
+        };
+        if let Some(gesture) = shell.pane_mouse_gesture.as_ref() {
+            return match mouse.kind {
+                MouseEventKind::Drag(button) | MouseEventKind::Up(button)
+                    if button == gesture.button =>
+                {
+                    gesture.route.clone()
+                }
+                _ => None,
+            };
+        }
+        let hit = shell
+            .hits
+            .panes
+            .iter()
+            .find(|hit| contains(hit.inner_rect, (mouse.column, mouse.row)))?;
+        let pane = shell
+            .snapshot
+            .as_deref()?
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == hit.pane_id)?;
+        let route = &self.binding.as_ref()?.route;
+        if route.terminal_target.as_deref() == pane.terminal_id.as_deref() {
+            return Some(route.clone());
+        }
+        Some(Arc::new(ClientInputRoute {
+            endpoint_id: route.endpoint_id.clone(),
+            connection_generation: route.connection_generation,
+            boot_id: route.boot_id.clone(),
+            terminal_target: pane.terminal_id.as_deref().map(Arc::from),
+        }))
     }
 
     fn local_command_event(shell: &ClientShellState, event: Option<&RawInputEvent>) -> bool {
@@ -705,6 +803,131 @@ impl ImeGate {
         frozen: bool,
         now: Instant,
     ) -> Result<(), ClientError> {
+        if !self.disabled
+            && shell.ime_control_enabled
+            && self
+                .synchronize_enabled(shell, endpoints, frozen, now)
+                .is_ok()
+        {
+            return Ok(());
+        }
+        self.disable();
+        self.synchronize_plain(shell, endpoints, frozen, now);
+        Ok(())
+    }
+
+    fn synchronize_plain(
+        &mut self,
+        shell: &mut ClientShellState,
+        endpoints: &EndpointRegistry,
+        frozen: bool,
+        now: Instant,
+    ) {
+        shell.disable_ime_control();
+        let focused = shell.outer_focused != Some(false);
+        if focused != self.focused {
+            self.focused = focused;
+            self.focus_epoch = self.focus_epoch.wrapping_add(1);
+        }
+        let binding = (!frozen && endpoints.active_surface_available())
+            .then(|| {
+                let connection = endpoints.connection(endpoints.active_id())?;
+                let snapshot = shell.snapshot.as_deref()?;
+                if &shell.active_endpoint_id != endpoints.active_id()
+                    || !shell.endpoint_is_online(endpoints.active_id())
+                    || shell.active_snapshot_generation != Some(connection.generation)
+                {
+                    return None;
+                }
+                let terminal = if shell.popup_pending {
+                    None
+                } else if let Some(terminal) = shell.popup_terminal_id.as_deref() {
+                    Some(terminal)
+                } else {
+                    snapshot.focused_pane_id.as_ref().and_then(|pane_id| {
+                        snapshot
+                            .panes
+                            .iter()
+                            .find(|pane| &pane.pane_id == pane_id)
+                            .and_then(|pane| pane.terminal_id.as_deref())
+                    })
+                };
+                if let Some(previous) = self.binding.as_ref().filter(|previous| {
+                    &previous.route.endpoint_id == endpoints.active_id()
+                        && previous.route.connection_generation == connection.generation
+                        && previous.route.boot_id.as_ref() == snapshot.boot_id
+                        && previous.terminal.as_deref() == terminal
+                        && previous.popup_pending == shell.popup_pending
+                        && previous.focus_epoch == self.focus_epoch
+                }) {
+                    return Some(previous.clone());
+                }
+                let terminal = terminal.map(Arc::from);
+                Some(InputBinding {
+                    route: Arc::new(ClientInputRoute {
+                        endpoint_id: endpoints.active_id().clone(),
+                        connection_generation: connection.generation,
+                        boot_id: Arc::from(snapshot.boot_id.as_str()),
+                        terminal_target: terminal.clone(),
+                    }),
+                    terminal,
+                    popup_pending: shell.popup_pending,
+                    focus_epoch: self.focus_epoch,
+                })
+            })
+            .flatten();
+        if self.binding != binding {
+            let staged_command = self.batches.front().is_some_and(|batch| {
+                batch.pending_outcome.is_some()
+                    && binding.as_ref().is_some_and(|next| {
+                        focused
+                            && batch.binding.focus_epoch == next.focus_epoch
+                            && batch.binding.route.endpoint_id == next.route.endpoint_id
+                            && batch.binding.route.connection_generation
+                                == next.route.connection_generation
+                            && batch.binding.route.boot_id == next.route.boot_id
+                    })
+            });
+            if staged_command {
+                // The trigger has already mutated local UI. Dispatch its captured
+                // request once, with its original endpoint and target parameters.
+                self.batches.front_mut().unwrap().binding = binding.as_ref().unwrap().clone();
+            } else if !binding
+                .as_ref()
+                .is_some_and(|next| self.commit_mouse_focus(shell, next))
+            {
+                self.cancel(shell);
+            }
+            self.binding = binding;
+        }
+        if self.mouse_focus_wait_finished(shell, now) {
+            // Keep the original click and old-target keys. Only its focus proposal
+            // has already run; no projection or source permission is invented.
+            self.batches.front_mut().unwrap().focus_target = None;
+            shell.mouse_focus_request = None;
+        }
+        shell.input_route = self.binding.as_ref().map(|binding| binding.route.clone());
+        self.waiting_target = self
+            .batches
+            .front()
+            .is_some_and(|batch| batch.focus_target.is_some());
+        self.release_ready = self.batches.front().is_some_and(|batch| {
+            batch.pending_outcome.is_none()
+                && batch
+                    .events
+                    .front()
+                    .is_some_and(|event| is_balancing_release(event, shell))
+        });
+        self.copy_blocked = shell.copy_operation_in_flight;
+    }
+
+    fn synchronize_enabled(
+        &mut self,
+        shell: &mut ClientShellState,
+        endpoints: &EndpointRegistry,
+        frozen: bool,
+        now: Instant,
+    ) -> Result<(), ClientError> {
         let cache_changed = self.update_cache(shell, endpoints)?;
         let focused = shell.outer_focused != Some(false);
         let focus_changed = focused != self.focused;
@@ -719,6 +942,31 @@ impl ImeGate {
         } else {
             self.physical_binding(shell, endpoints)
         };
+        if !frozen
+            && binding.is_none()
+            && endpoints.active_surface_available()
+            && &shell.active_endpoint_id == endpoints.active_id()
+            && shell.endpoint_is_online(endpoints.active_id())
+            && endpoints
+                .connection(endpoints.active_id())
+                .is_some_and(|connection| {
+                    shell.active_snapshot_generation == Some(connection.generation)
+                })
+            && !shell.popup_pending
+            && shell.popup_terminal_id.is_none()
+            && shell.snapshot.as_deref().is_some_and(|snapshot| {
+                snapshot.focused_pane_id.as_ref().is_some_and(|pane_id| {
+                    snapshot
+                        .panes
+                        .iter()
+                        .any(|pane| &pane.pane_id == pane_id && pane.terminal_id.is_none())
+                })
+            })
+        {
+            // An ordinary pane route can remain usable without the optional
+            // terminal identity needed to acquire an IME lease.
+            return Err(ClientError::InputIntentProtocolError);
+        }
         let (popup_continuation, popup_waiting) =
             self.local_popup_transition(shell, binding.as_ref());
         if self.binding != binding {
@@ -805,6 +1053,9 @@ impl ImeGate {
                     })
                 })
             });
+        }
+        if self.mouse_focus_wait_finished(shell, now) {
+            return Err(ClientError::ImeAckTimeout);
         }
         shell.input_route = self.binding.as_ref().map(|binding| binding.route.clone());
         self.waiting_target = self
@@ -975,10 +1226,20 @@ impl ImeGate {
     ) -> Result<(), ClientError> {
         // Errors on obsolete work are not source authorization either. The latest release
         // remains queued by the worker; only the exact current tuple can affect this gate.
+        if self.disabled {
+            return Ok(());
+        }
         if self.authorization.as_deref() != Some(completion.authorization.as_ref()) {
             return Ok(());
         }
-        match completion.result.map_err(ClientError::ImeControl)? {
+        let scope = match completion.result {
+            Ok(scope) => scope,
+            Err(_) => {
+                self.disable();
+                return Ok(());
+            }
+        };
+        match scope {
             AckScope::Applied => {
                 self.applied = true;
                 self.inactive = false;
@@ -1080,11 +1341,17 @@ impl ImeGate {
         }
         if !semantic.is_empty() {
             let was_empty = self.batches.is_empty();
-            crate::client::shell_runtime::require_client_input_intents(
-                Some(shell),
-                endpoints,
-                true,
-            )?;
+            if !self.disabled
+                && crate::client::shell_runtime::require_client_input_intents(
+                    Some(shell),
+                    endpoints,
+                    true,
+                )
+                .is_err()
+            {
+                self.disable();
+                shell.disable_ime_control();
+            }
             let binding = self
                 .binding
                 .clone()
@@ -1092,12 +1359,14 @@ impl ImeGate {
             if self.batches.len() >= INPUT_BATCH_LIMIT
                 || raw.len() > INPUT_BYTE_LIMIT.saturating_sub(self.bytes)
             {
-                return Err(ClientError::ImeInputOverflow);
+                self.disable();
+                shell.disable_ime_control();
             }
             // Share an outstanding foreground read for this exact tuple, never a
             // cached Applied result. Invalidating every waiting batch would starve
             // slow RPCs indefinitely while a user continues typing.
-            if semantic.iter().any(|event| !is_release(event))
+            if !self.disabled
+                && semantic.iter().any(|event| !is_release(event))
                 && (was_empty || self.applied || self.inactive || !self.episode || !self.submitted)
             {
                 self.episode = true;
@@ -1123,6 +1392,7 @@ impl ImeGate {
                 image_checked: false,
                 forward_prefix: false,
                 focus_target: None,
+                focus_requested: false,
                 pending_outcome: None,
                 replay: false,
                 pixels,
@@ -1153,10 +1423,20 @@ impl ImeGate {
         now: Instant,
     ) -> Result<ClientShellInput, ClientError> {
         self.synchronize(shell, endpoints, frozen, now)?;
-        let origin = replay.origin.ok_or(ClientError::InputIntentProtocolError)?;
+        let Some(origin) = replay.origin else {
+            if !self.disabled {
+                self.disable();
+                shell.disable_ime_control();
+            }
+            if frozen || !self.focused {
+                return Ok(ClientShellInput::default());
+            }
+            return Ok(shell.replay_mouse_events(replay.events));
+        };
         if !self.focused
             || frozen
-            || self.authorization.as_deref() != Some(origin.authorization.as_ref())
+            || (!self.disabled
+                && self.authorization.as_deref() != Some(origin.authorization.as_ref()))
             || !self
                 .binding
                 .as_ref()
@@ -1168,22 +1448,22 @@ impl ImeGate {
                 ..Default::default()
             });
         }
-        if now >= origin.deadline {
-            return Err(ClientError::ImeAckTimeout);
+        if !self.disabled && (now >= origin.deadline || self.batches.len() >= INPUT_BATCH_LIMIT) {
+            self.disable();
+            shell.disable_ime_control();
         }
-        if self.batches.len() >= INPUT_BATCH_LIMIT {
-            return Err(ClientError::ImeInputOverflow);
+        if !self.disabled {
+            self.arbitration_epoch = self.arbitration_epoch.wrapping_add(1);
+            let key = self.authorization.as_ref().unwrap();
+            self.authorization = Some(Arc::new(AuthorizationKey {
+                identity: key.identity.clone(),
+                intent_generation: key.intent_generation,
+                focus_epoch: key.focus_epoch,
+                arbitration_epoch: self.arbitration_epoch,
+            }));
+            self.applied = false;
+            self.submitted = false;
         }
-        self.arbitration_epoch = self.arbitration_epoch.wrapping_add(1);
-        let key = self.authorization.as_ref().unwrap();
-        self.authorization = Some(Arc::new(AuthorizationKey {
-            identity: key.identity.clone(),
-            intent_generation: key.intent_generation,
-            focus_epoch: key.focus_epoch,
-            arbitration_epoch: self.arbitration_epoch,
-        }));
-        self.applied = false;
-        self.submitted = false;
         // This is the retained original TTY click, not a business-message input
         // episode. Its original tuple and five-second deadline are both retained.
         self.batches.push_back(InputBatch {
@@ -1197,6 +1477,7 @@ impl ImeGate {
             image_checked: true,
             forward_prefix: false,
             focus_target: None,
+            focus_requested: false,
             pending_outcome: None,
             replay: true,
             pixels: None,
@@ -1228,10 +1509,41 @@ impl ImeGate {
             return Ok(None);
         }
         if batch.pending_outcome.is_some() {
-            if !self.applied || self.waiting_target {
+            if !self.disabled && (!self.applied || self.waiting_target) {
                 return Ok(None);
             }
-            let outcome = batch.pending_outcome.take().unwrap();
+            let mut outcome = batch.pending_outcome.take().unwrap();
+            if self.disabled {
+                outcome.actions = outcome
+                    .actions
+                    .into_iter()
+                    .map(|action| match action {
+                        ClientShellAction::Endpoint {
+                            endpoint_id,
+                            boot_id,
+                            mut request,
+                        } => {
+                            request.method = match request.method {
+                                crate::api::schema::Method::CommandInvokeReceipt(params) => {
+                                    if let Some(pending) =
+                                        shell.pending_requests.get_mut(&request.id)
+                                    {
+                                        pending.method_name = "command.invoke".into();
+                                    }
+                                    crate::api::schema::Method::CommandInvoke(params)
+                                }
+                                method => method,
+                            };
+                            ClientShellAction::Endpoint {
+                                endpoint_id,
+                                boot_id,
+                                request,
+                            }
+                        }
+                        action => action,
+                    })
+                    .collect();
+            }
             if batch.events.is_empty() {
                 let batch = self.batches.pop_front().unwrap();
                 self.bytes -= batch.raw.len();
@@ -1241,7 +1553,7 @@ impl ImeGate {
         }
         // Double-prefix changes mode AND forwards the trigger. Consume only the pure
         // transition now, and route/track the press once after the new target ACK.
-        if !batch.forward_prefix && shell.mode == ClientShellMode::Prefix && shell.overlay.is_none() && batch.events.front().is_some_and(|event| matches!(event, RawInputEvent::Key(key) if key.kind == KeyEventKind::Press && shell.config.keybinds.matches_prefix(key))) {
+        if !self.disabled && !batch.forward_prefix && shell.mode == ClientShellMode::Prefix && shell.overlay.is_none() && batch.events.front().is_some_and(|event| matches!(event, RawInputEvent::Key(key) if key.kind == KeyEventKind::Press && shell.config.keybinds.matches_prefix(key))) {
             shell.mode = shell.copy_or_terminal_mode();
             shell.ime_forward_prefix = true;
             batch.forward_prefix = true;
@@ -1253,11 +1565,14 @@ impl ImeGate {
             .events
             .front()
             .is_some_and(|event| is_balancing_release(event, shell));
-        if !release && (!self.applied || self.copy_blocked || self.waiting_target) {
+        if !release
+            && ((!self.applied && !self.disabled) || self.copy_blocked || self.waiting_target)
+        {
             return Ok(None);
         }
         let batch = self.batches.front_mut().unwrap();
-        if !release
+        if !self.disabled
+            && !release
             && shell.overlay.is_none()
             && !shell.popup_pending
             && shell.popup_terminal_id.is_none()
@@ -1292,20 +1607,39 @@ impl ImeGate {
                             && cached.route.boot_id == batch.binding.route.boot_id
                     })
                     .and_then(|cached| cached.panes.get(&hit.pane_id))
-                    .cloned()
-                    .ok_or(ClientError::InputIntentProtocolError)?;
-                batch.focus_target = Some((hit.pane_id.clone(), terminal));
-                batch.image_checked = true;
-                let mut outcome = ClientShellInput::default();
-                shell.push_endpoint_method(
-                    crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
-                        pane_id: hit.pane_id.clone(),
-                    }),
-                    &mut outcome,
-                );
-                return Ok(Some(outcome));
+                    .cloned();
+                if let Some(terminal) = terminal {
+                    batch.focus_requested = true;
+                    batch.image_checked = true;
+                    let mut outcome = ClientShellInput::default();
+                    shell.push_endpoint_method(
+                        crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
+                            pane_id: hit.pane_id.clone(),
+                        }),
+                        &mut outcome,
+                    );
+                    batch.focus_target = outcome.actions.iter().find_map(|action| match action {
+                        ClientShellAction::Endpoint { request, .. } => Some(MouseFocusTarget {
+                            terminal: terminal.clone(),
+                            request_id: Arc::from(request.id.as_str()),
+                        }),
+                        _ => None,
+                    });
+                    if let Some(target) = &batch.focus_target {
+                        shell.mouse_focus_request = Some((target.request_id.clone(), false));
+                    } else {
+                        self.disable();
+                        shell.disable_ime_control();
+                    }
+                    return Ok(Some(outcome));
+                }
+                // A visible ordinary pane need not expose an IME terminal identity.
+                // Retain this click and let the existing non-IME handler dispatch it.
+                self.disable();
+                shell.disable_ime_control();
             }
         }
+        let batch = self.batches.front_mut().unwrap();
         if !release && !batch.image_checked {
             batch.image_checked = true;
             #[cfg(unix)]
@@ -1327,7 +1661,7 @@ impl ImeGate {
                         endpoints,
                         target,
                         image,
-                        "IME-authorized clipboard paste",
+                        "clipboard paste",
                     )?;
                     let batch = self.batches.pop_front().unwrap();
                     self.bytes -= batch.raw.len();
@@ -1340,11 +1674,16 @@ impl ImeGate {
             self.bytes -= batch.raw.len();
             return Ok(Some(ClientShellInput::default()));
         };
+        let mouse_route = self.plain_mouse_route(shell, &event);
+        let previous_route = mouse_route.map(|route| shell.input_route.replace(route));
+        let batch = self.batches.front_mut().unwrap();
         batch.cursor += 1;
         shell.host_mouse_pixels = batch.pixels;
         shell.ime_forward_prefix = batch.forward_prefix;
         shell.ime_input_deadline = Some(batch.deadline);
         shell.replaying_url_click = batch.replay;
+        shell.suppress_mouse_focus_request =
+            batch.focus_requested && matches!(&event, RawInputEvent::Mouse(_));
         let prior_ui = (
             shell.mode,
             shell.overlay.as_ref().map(ClientShellOverlay::kind),
@@ -1352,7 +1691,12 @@ impl ImeGate {
         );
         let command_trigger = Self::local_command_event(shell, Some(&event));
         batch.forward_prefix = false;
+        batch.focus_requested = false;
         let outcome = shell.handle_raw_events([event]);
+        shell.suppress_mouse_focus_request = false;
+        if let Some(route) = previous_route {
+            shell.input_route = route;
+        }
         shell.host_mouse_pixels = None;
         shell.ime_forward_prefix = false;
         shell.ime_input_deadline = None;
@@ -1421,8 +1765,44 @@ fn merge(target: &mut ClientShellInput, mut source: ClientShellInput) {
 impl ClientShellState {
     pub(crate) fn enable_ime_control(&mut self) {
         self.ime_control_enabled = true;
+        self.ime_control_requested = true;
         self.pending_input_source_changes.clear();
     }
+    pub(in crate::client) fn disable_ime_control(&mut self) {
+        self.ime_control_enabled = false;
+        self.ime_authorization = None;
+        self.ime_input_deadline = None;
+        self.pending_input_source_changes.clear();
+    }
+    pub(in crate::client) fn replay_mouse_without_ime(
+        &mut self,
+        endpoints: &EndpointRegistry,
+        replay: ClientMouseReplay,
+        frozen: bool,
+    ) -> ClientShellInput {
+        self.disable_ime_control();
+        if frozen
+            || !endpoints.active_surface_available()
+            || self.outer_focused == Some(false)
+            || replay.origin.as_ref().is_some_and(|origin| {
+                self.input_route.as_ref() != Some(&origin.route)
+                    || endpoints.active_id() != &origin.route.endpoint_id
+                    || endpoints
+                        .connection(&origin.route.endpoint_id)
+                        .is_none_or(|connection| {
+                            connection.generation != origin.route.connection_generation
+                        })
+                    || !self.endpoint_route_boot_matches(
+                        &origin.route.endpoint_id,
+                        &origin.route.boot_id,
+                    )
+            })
+        {
+            return ClientShellInput::default();
+        }
+        self.replay_mouse_events(replay.events)
+    }
+
     pub(super) fn mouse_replay_origin(&self) -> Option<ClientReplayOrigin> {
         Some(ClientReplayOrigin {
             route: self.input_route.as_ref()?.clone(),
@@ -1448,9 +1828,6 @@ impl ClientShellState {
         route: &ClientInputRoute,
         request: &ClientMessage,
     ) -> bool {
-        let Some(terminal) = route.terminal_target.as_deref() else {
-            return false;
-        };
         match request {
             ClientMessage::ClientShellPaneInput { pane_id, .. } => self
                 .endpoints
@@ -1458,8 +1835,12 @@ impl ClientShellState {
                 .find(|endpoint| endpoint.endpoint_id == route.endpoint_id)
                 .and_then(|endpoint| endpoint.snapshot.as_deref())
                 .and_then(|snapshot| snapshot.panes.iter().find(|pane| &pane.pane_id == pane_id))
-                .is_some_and(|pane| pane.terminal_id.as_deref() == Some(terminal)),
-            ClientMessage::ClientShellPopupInput { terminal_id, .. } => terminal_id == terminal,
+                .is_some_and(|pane| {
+                    pane.terminal_id.as_deref() == route.terminal_target.as_deref()
+                }),
+            ClientMessage::ClientShellPopupInput { terminal_id, .. } => {
+                route.terminal_target.as_deref() == Some(terminal_id.as_str())
+            }
             _ => false,
         }
     }
@@ -1742,10 +2123,9 @@ mod tests {
         ));
         registry.set_surface_active(&ClientEndpointId::Local, true);
         registry.unfreeze_input();
-        assert!(matches!(
-            gate.synchronize(&mut shell, &registry, false, now),
-            Err(ClientError::InputIntentUnsupported)
-        ));
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+        assert!(!gate.enabled() && !gate.applied);
+        assert!(shell.endpoint_error.is_none());
     }
 
     #[test]
@@ -1847,10 +2227,708 @@ mod tests {
             2,
             Box::new(malformed),
         );
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+        assert!(!gate.enabled() && !gate.applied);
+        enqueue(&mut gate, &mut shell, &registry, b"m", now);
+        let outcome = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+        send(&shell, &mut registry, outcome);
+        assert!(matches!(reconnected.try_recv().unwrap(),
+            ClientMessage::ClientShellPaneInput { pane_id, .. } if pane_id == "pane_1"));
+    }
+
+    #[test]
+    fn missing_terminal_identity_uses_ordinary_pane_input_without_ime_authorization() {
+        let (mut gate, mut shell, mut registry, messages) =
+            fixture(Some(InputIntentState::Command));
+        let mut snapshot = shell.snapshot.as_ref().unwrap().as_ref().clone();
+        snapshot.panes[0].terminal_id = None;
+        shell.set_endpoint_snapshot_for_generation(&ClientEndpointId::Local, 1, Box::new(snapshot));
+        let now = Instant::now();
+        enqueue(&mut gate, &mut shell, &registry, b"x", now);
+        let outcome = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+        send(&shell, &mut registry, outcome);
+        assert!(matches!(messages.try_recv().unwrap(),
+            ClientMessage::ClientShellPaneInput { pane_id, events }
+                if pane_id == "pane_1" && events.len() == 1));
+        assert!(!gate.enabled() && gate.authorization.is_none());
+        assert!(shell.input_route.as_ref().is_some_and(|route| {
+            route.terminal_target.is_none() && route.connection_generation == 1
+        }));
+        assert!(shell.ime_authorization.is_none());
+        assert!(shell.endpoint_error.is_none() && shell.visible_endpoint_notice.is_none());
+        assert!(registry.active_surface_available());
+    }
+
+    #[test]
+    fn failed_current_ack_drains_retained_fifo_without_source_authorization_or_notice() {
+        use crate::client::ime_control::ImeError;
+        use crate::protocol::ClientKeyCode;
+
+        for error in [
+            ImeError::GuiUnavailable,
+            ImeError::Transport("closed".into()),
+            ImeError::BadAck("invalid".into()),
+            ImeError::Timeout,
+            ImeError::WorkerStopped,
+            ImeError::Daemon("backend_unavailable".into()),
+        ] {
+            let (mut gate, mut shell, mut registry, messages) =
+                fixture(Some(InputIntentState::Command));
+            let now = Instant::now();
+            enqueue(&mut gate, &mut shell, &registry, b"xy", now);
+            enqueue(&mut gate, &mut shell, &registry, b"z", now);
+            let authorization = gate.authorization.as_ref().unwrap().clone();
+            gate.complete(Completion {
+                authorization: authorization.clone(),
+                result: Err(error),
+            })
+            .unwrap();
+            while let Some(outcome) = dispatch(&mut gate, &mut shell, &mut registry, now) {
+                send(&shell, &mut registry, outcome);
+            }
+            let forwarded: Vec<_> = messages
+                .try_iter()
+                .flat_map(|message| match message {
+                    ClientMessage::ClientShellPaneInput { pane_id, events } => {
+                        assert_eq!(pane_id, "pane_1");
+                        events
+                    }
+                    message => panic!("unexpected message: {message:?}"),
+                })
+                .map(|event| match event {
+                    ClientPaneInputEvent::Key { code, .. } => code,
+                    event => panic!("unexpected event: {event:?}"),
+                })
+                .collect();
+            assert_eq!(
+                forwarded,
+                vec![
+                    ClientKeyCode::Char('x'),
+                    ClientKeyCode::Char('y'),
+                    ClientKeyCode::Char('z'),
+                ]
+            );
+            assert!(!gate.applied && !gate.authorized() && gate.authorization.is_none());
+            assert!(shell.ime_authorization.is_none());
+            assert!(!shell.ime_control_enabled);
+            assert!(shell.endpoint_error.is_none() && shell.visible_endpoint_notice.is_none());
+            gate.complete(Completion {
+                authorization,
+                result: Ok(AckScope::Applied),
+            })
+            .unwrap();
+            enqueue(&mut gate, &mut shell, &registry, b"j", now);
+            let outcome = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+            send(&shell, &mut registry, outcome);
+            assert!(!gate.applied && gate.pending_plan.is_none());
+        }
+    }
+
+    #[test]
+    fn saturated_replay_channel_returns_the_original_click_for_plain_dispatch_once() {
+        let (mut gate, mut shell, mut registry, messages) =
+            fixture(Some(InputIntentState::Command));
+        let mut surface = super::super::tests::surface();
+        surface.panes[0].mouse_reporting = true;
+        shell.set_pane_surface(surface);
+        shell.compose(100, 28).unwrap();
+        let hit = shell.hits.panes[0].clone();
+        let now = Instant::now();
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+        applied(&mut gate);
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+        let replay = ClientMouseReplay {
+            events: [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ]
+            .into_iter()
+            .map(|kind| MouseEvent {
+                kind,
+                column: hit.inner_rect.x,
+                row: hit.inner_rect.y,
+                modifiers: KeyModifiers::NONE,
+            })
+            .collect(),
+            origin: Some(ClientReplayOrigin {
+                route: gate.binding.as_ref().unwrap().route.clone(),
+                authorization: gate.authorization.as_ref().unwrap().clone(),
+                deadline: now + INPUT_WAIT,
+            }),
+        };
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        assert!(sender.try_send(ClientLoopEvent::ImeDrain).is_ok());
+        let replay = crate::client::shell_runtime::queue_mouse_replay(&sender, replay)
+            .expect("a full event channel must retain the original click");
+        let outcome = shell.replay_mouse_without_ime(&registry, replay, false);
+        assert!(outcome.actions.is_empty());
+        send(&shell, &mut registry, outcome);
+        let kinds: Vec<_> = messages
+            .try_iter()
+            .flat_map(|message| match message {
+                ClientMessage::ClientShellPaneInput { pane_id, events } => {
+                    assert_eq!(pane_id, "pane_1");
+                    events
+                }
+                message => panic!("unexpected message: {message:?}"),
+            })
+            .map(|event| match event {
+                ClientPaneInputEvent::Mouse { kind, .. } => kind,
+                event => panic!("unexpected event: {event:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                crate::protocol::ClientMouseKind::Down(crate::protocol::ClientMouseButton::Left),
+                crate::protocol::ClientMouseKind::Up(crate::protocol::ClientMouseButton::Left),
+            ]
+        );
         assert!(matches!(
-            gate.synchronize(&mut shell, &registry, false, now),
-            Err(ClientError::InputIntentProtocolError)
+            receiver.try_recv().unwrap(),
+            ClientLoopEvent::ImeDrain
         ));
+        assert!(receiver.try_recv().is_err());
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+        assert!(!gate.enabled() && !gate.applied && shell.ime_authorization.is_none());
+    }
+
+    #[test]
+    fn failed_ack_keeps_partial_batch_cursor_and_forwards_double_prefix_only_once() {
+        use crate::protocol::ClientKeyCode;
+
+        for staged_prefix in [false, true] {
+            let (mut gate, mut shell, mut registry, messages) =
+                fixture(Some(InputIntentState::Command));
+            let now = Instant::now();
+            if staged_prefix {
+                shell.mode = ClientShellMode::Prefix;
+                enqueue(&mut gate, &mut shell, &registry, b"\x02yz", now);
+            } else {
+                enqueue(&mut gate, &mut shell, &registry, b"xyz", now);
+            }
+            applied(&mut gate);
+            let first = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+            send(&shell, &mut registry, first);
+            assert_eq!(
+                gate.batches.front().unwrap().cursor,
+                usize::from(!staged_prefix)
+            );
+            enqueue(&mut gate, &mut shell, &registry, b"j", now);
+            gate.complete(Completion {
+                authorization: gate.authorization.as_ref().unwrap().clone(),
+                result: Err(crate::client::ime_control::ImeError::BadAck(
+                    "closed".into(),
+                )),
+            })
+            .unwrap();
+            while let Some(outcome) = dispatch(&mut gate, &mut shell, &mut registry, now) {
+                send(&shell, &mut registry, outcome);
+            }
+            let codes: Vec<_> = messages
+                .try_iter()
+                .flat_map(|message| match message {
+                    ClientMessage::ClientShellPaneInput { pane_id, events } => {
+                        assert_eq!(pane_id, "pane_1");
+                        events
+                    }
+                    message => panic!("unexpected message: {message:?}"),
+                })
+                .map(|event| match event {
+                    ClientPaneInputEvent::Key { code, .. } => code,
+                    event => panic!("unexpected event: {event:?}"),
+                })
+                .collect();
+            assert_eq!(
+                codes,
+                vec![
+                    ClientKeyCode::Char(if staged_prefix { 'b' } else { 'x' }),
+                    ClientKeyCode::Char('y'),
+                    ClientKeyCode::Char('z'),
+                    ClientKeyCode::Char('j'),
+                ]
+            );
+            assert_eq!(shell.mode, ClientShellMode::Terminal);
+            assert!(gate.batches.is_empty() && !gate.applied);
+        }
+    }
+
+    #[test]
+    fn failed_ack_dispatches_consumed_prefix_command_once_without_direct_switch_fallback() {
+        let (mut gate, mut shell, mut registry, messages) =
+            fixture(Some(InputIntentState::Command));
+        shell.config.prompt_new_tab_name = false;
+        shell.config.switch_ascii_input_source_in_prefix = true;
+        let now = Instant::now();
+        enqueue(&mut gate, &mut shell, &registry, b"\x02c", now);
+        applied(&mut gate);
+        dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+        applied(&mut gate);
+        dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+        assert!(gate.batches.front().unwrap().pending_outcome.is_some());
+        gate.complete(Completion {
+            authorization: gate.authorization.as_ref().unwrap().clone(),
+            result: Err(crate::client::ime_control::ImeError::Timeout),
+        })
+        .unwrap();
+        let command = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+        assert!(matches!(command.actions.as_slice(),
+            [ClientShellAction::Endpoint { endpoint_id: ClientEndpointId::Local, boot_id, request }]
+                if boot_id == "boot-1" && matches!(request.method, crate::api::schema::Method::TabCreate(_))));
+        assert!(dispatch(&mut gate, &mut shell, &mut registry, now).is_none());
+        assert!(messages.try_recv().is_err());
+        enqueue(&mut gate, &mut shell, &registry, b"\x02", now);
+        dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+        assert_eq!(shell.mode, ClientShellMode::Prefix);
+        shell.reconcile_input_source();
+        assert!(shell.take_input_source_changes().is_empty());
+        assert!(shell.ime_authorization.is_none() && !gate.applied);
+    }
+
+    #[test]
+    fn focus_request_failures_and_missing_projection_release_plain_fifo_without_replaying_focus() {
+        use crate::client::endpoint_commands::EndpointCommands;
+
+        for failure in [
+            "rejected",
+            "endpoint_timeout",
+            "success_without_projection",
+            "no_response",
+        ] {
+            for already_disabled in [false, true] {
+                for navigate in [false, true] {
+                    let (mut gate, mut shell, mut registry, messages) =
+                        fixture(Some(InputIntentState::Command));
+                    two_panes(&mut shell, false);
+                    let hit = shell
+                        .hits
+                        .panes
+                        .iter()
+                        .find(|hit| hit.pane_id == "pane_2")
+                        .unwrap()
+                        .clone();
+                    let now = Instant::now();
+                    let mouse = |kind| {
+                        RawInputEvent::Mouse(MouseEvent {
+                            kind,
+                            column: hit.inner_rect.x
+                                + u16::from(matches!(kind, MouseEventKind::Drag(_))),
+                            row: hit.inner_rect.y,
+                            modifiers: KeyModifiers::NONE,
+                        })
+                    };
+                    gate.enqueue(
+                        &mut shell,
+                        &registry,
+                        Vec::new(),
+                        vec![
+                            mouse(MouseEventKind::Down(MouseButton::Left)),
+                            RawInputEvent::Key(crate::input::TerminalKey::new(
+                                KeyCode::Char('x'),
+                                KeyModifiers::NONE,
+                            )),
+                            mouse(MouseEventKind::Drag(MouseButton::Left)),
+                            mouse(MouseEventKind::Up(MouseButton::Left)),
+                        ],
+                        None,
+                        false,
+                        now,
+                    )
+                    .unwrap();
+                    applied(&mut gate);
+                    let focus = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+                    let request_id = match focus.actions.as_slice() {
+                        [ClientShellAction::Endpoint { request, .. }] => request.id.clone(),
+                        actions => panic!("expected one focus action: {actions:?}"),
+                    };
+                    assert!(matches!(
+                        shell.pending_requests[&request_id].kind,
+                        PendingEndpointKind::Generic
+                    ));
+                    let mut commands = EndpointCommands::default();
+                    crate::client::shell_runtime::dispatch_client_shell_actions(
+                        focus.actions,
+                        &mut commands,
+                        &mut registry,
+                        Some(&mut shell),
+                        &mut Vec::new(),
+                        &mut None,
+                    )
+                    .unwrap();
+                    gate.synchronize(&mut shell, &registry, false, now).unwrap();
+                    enqueue(
+                        &mut gate,
+                        &mut shell,
+                        &registry,
+                        if navigate { b"k\x02w" } else { b"k\x02q" },
+                        now,
+                    );
+                    if already_disabled {
+                        gate.complete(Completion {
+                            authorization: gate.authorization.as_ref().unwrap().clone(),
+                            result: Err(crate::client::ime_control::ImeError::WorkerStopped),
+                        })
+                        .unwrap();
+                        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+                    }
+                    assert_eq!(gate.deadline(), Some(now + INPUT_WAIT));
+                    let at = match failure {
+                        "rejected" => {
+                            let response = commands.receive_chunk(&ClientEndpointId::Local, 1,
+                                "boot-1", &request_id, true, serde_json::to_vec(&serde_json::json!({
+                                    "id": request_id,
+                                    "error": { "code": "stale_target", "message": "focus refused" }
+                                })).unwrap()).unwrap().unwrap();
+                            assert!(response.result.is_err());
+                            shell.handle_endpoint_result(
+                                &response.boot_id,
+                                &response.request_id,
+                                response.result,
+                            );
+                            now
+                        }
+                        "endpoint_timeout" => {
+                            let at = now + Duration::from_secs(61);
+                            let response = commands.expire(at).pop().expect("real request timeout");
+                            assert!(matches!(&response.result, Err(error)
+                                if error.code.as_deref() == Some("endpoint_timeout")));
+                            shell.handle_endpoint_result(
+                                &response.boot_id,
+                                &response.request_id,
+                                response.result,
+                            );
+                            at
+                        }
+                        "success_without_projection" => {
+                            let response = commands
+                                .receive_chunk(
+                                    &ClientEndpointId::Local,
+                                    1,
+                                    "boot-1",
+                                    &request_id,
+                                    true,
+                                    serde_json::to_vec(&crate::api::schema::SuccessResponse {
+                                        id: request_id.clone(),
+                                        result: crate::api::schema::ResponseResult::Ok {},
+                                    })
+                                    .unwrap(),
+                                )
+                                .unwrap()
+                                .unwrap();
+                            shell.handle_endpoint_result(
+                                &response.boot_id,
+                                &response.request_id,
+                                response.result,
+                            );
+                            gate.synchronize(&mut shell, &registry, false, now).unwrap();
+                            assert!(!gate.ready(), "ACK alone must not fake a focus projection");
+                            now + INPUT_WAIT
+                        }
+                        "no_response" => now + INPUT_WAIT,
+                        _ => unreachable!(),
+                    };
+                    let mut detach = 0;
+                    while let Some(outcome) = dispatch(&mut gate, &mut shell, &mut registry, at) {
+                        assert!(
+                            outcome.actions.is_empty(),
+                            "already-sent PaneFocus must not repeat"
+                        );
+                        detach += usize::from(outcome.detach);
+                        send(&shell, &mut registry, outcome);
+                    }
+                    assert!(!gate.enabled() && !gate.applied && !gate.ready());
+                    assert!(gate.deadline().is_none());
+                    assert_eq!(detach, usize::from(!navigate));
+                    assert_eq!(
+                        shell.mode,
+                        if navigate {
+                            ClientShellMode::Navigate
+                        } else {
+                            ClientShellMode::Terminal
+                        }
+                    );
+                    let mut focus_count = 0;
+                    let mut mouse_kinds = Vec::new();
+                    let mut keys = Vec::new();
+                    for message in messages.try_iter() {
+                        match message {
+                            ClientMessage::ClientShellEndpointRequest { request, .. } => {
+                                let request: serde_json::Value =
+                                    serde_json::from_str(&request).unwrap();
+                                assert_eq!(request["method"], "pane.focus");
+                                focus_count += 1;
+                            }
+                            ClientMessage::ClientShellPaneInput { pane_id, events } => {
+                                for event in events {
+                                    match event {
+                                        ClientPaneInputEvent::Mouse { kind, .. } => {
+                                            assert_eq!(pane_id, "pane_2");
+                                            mouse_kinds.push(kind);
+                                        }
+                                        ClientPaneInputEvent::Key {
+                                            code: crate::protocol::ClientKeyCode::Char(character),
+                                            ..
+                                        } => {
+                                            assert_eq!(
+                                                pane_id, "pane_1",
+                                                "old-target keys must not follow click"
+                                            );
+                                            keys.push(character);
+                                        }
+                                        event => panic!("unexpected event: {event:?}"),
+                                    }
+                                }
+                            }
+                            message => panic!("unexpected message: {message:?}"),
+                        }
+                    }
+                    assert_eq!(focus_count, 1);
+                    assert_eq!(keys, vec!['x', 'k']);
+                    assert_eq!(
+                        mouse_kinds,
+                        vec![
+                            crate::protocol::ClientMouseKind::Down(
+                                crate::protocol::ClientMouseButton::Left
+                            ),
+                            crate::protocol::ClientMouseKind::Drag(
+                                crate::protocol::ClientMouseButton::Left
+                            ),
+                            crate::protocol::ClientMouseKind::Up(
+                                crate::protocol::ClientMouseButton::Left
+                            ),
+                        ]
+                    );
+                    two_panes(&mut shell, true);
+                    assert!(dispatch(&mut gate, &mut shell, &mut registry, at).is_none());
+                    assert!(
+                        messages.try_recv().is_err(),
+                        "late projection must not replay input"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn click_on_unfocused_pane_without_terminal_identity_uses_plain_bound_route_once() {
+        let (mut gate, mut shell, mut registry, messages) =
+            fixture(Some(InputIntentState::Command));
+        two_panes(&mut shell, false);
+        let mut snapshot = shell.snapshot.as_ref().unwrap().as_ref().clone();
+        snapshot.panes[1].terminal_id = None;
+        shell.set_endpoint_snapshot_for_generation(&ClientEndpointId::Local, 1, Box::new(snapshot));
+        let hit = shell
+            .hits
+            .panes
+            .iter()
+            .find(|hit| hit.pane_id == "pane_2")
+            .unwrap()
+            .clone();
+        let now = Instant::now();
+        gate.enqueue(
+            &mut shell,
+            &registry,
+            Vec::new(),
+            [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Drag(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ]
+            .into_iter()
+            .map(|kind| {
+                RawInputEvent::Mouse(MouseEvent {
+                    kind,
+                    column: hit.inner_rect.x + u16::from(matches!(kind, MouseEventKind::Drag(_))),
+                    row: hit.inner_rect.y,
+                    modifiers: KeyModifiers::NONE,
+                })
+            })
+            .collect(),
+            None,
+            false,
+            now,
+        )
+        .unwrap();
+        enqueue(&mut gate, &mut shell, &registry, b"x\x02q", now);
+        applied(&mut gate);
+        let mut focus_count = 0;
+        let mut detach = 0;
+        while let Some(outcome) = dispatch(&mut gate, &mut shell, &mut registry, now) {
+            for action in &outcome.actions {
+                assert!(matches!(action, ClientShellAction::Endpoint { request, .. }
+                    if matches!(request.method, crate::api::schema::Method::PaneFocus(_))));
+                focus_count += 1;
+            }
+            for (route, request) in &outcome.routed_requests {
+                assert_eq!(route.endpoint_id, ClientEndpointId::Local);
+                assert_eq!(route.connection_generation, 1);
+                assert_eq!(route.boot_id.as_ref(), "boot-1");
+                if matches!(request, ClientMessage::ClientShellPaneInput { pane_id, .. }
+                    if pane_id == "pane_2")
+                {
+                    assert!(
+                        route.terminal_target.is_none(),
+                        "must not fabricate a terminal identity"
+                    );
+                }
+            }
+            detach += usize::from(outcome.detach);
+            send(&shell, &mut registry, outcome);
+        }
+        assert_eq!(focus_count, 1);
+        assert_eq!(detach, 1);
+        let mut kinds = Vec::new();
+        let mut keys = Vec::new();
+        for message in messages.try_iter() {
+            let ClientMessage::ClientShellPaneInput { pane_id, events } = message else {
+                panic!("unexpected message: {message:?}");
+            };
+            for event in events {
+                match event {
+                    ClientPaneInputEvent::Mouse { kind, .. } => {
+                        assert_eq!(pane_id, "pane_2");
+                        kinds.push(kind);
+                    }
+                    ClientPaneInputEvent::Key {
+                        code: crate::protocol::ClientKeyCode::Char(key),
+                        ..
+                    } => {
+                        assert_eq!(pane_id, "pane_1");
+                        keys.push(key);
+                    }
+                    event => panic!("unexpected event: {event:?}"),
+                }
+            }
+        }
+        assert_eq!(
+            kinds,
+            vec![
+                crate::protocol::ClientMouseKind::Down(crate::protocol::ClientMouseButton::Left),
+                crate::protocol::ClientMouseKind::Drag(crate::protocol::ClientMouseButton::Left),
+                crate::protocol::ClientMouseKind::Up(crate::protocol::ClientMouseButton::Left),
+            ]
+        );
+        assert_eq!(keys, vec!['x']);
+        assert!(!gate.enabled() && !gate.applied && gate.authorization.is_none());
+        assert!(shell.ime_authorization.is_none() && shell.visible_endpoint_notice.is_none());
+    }
+
+    #[test]
+    fn failed_ack_after_mouse_focus_does_not_repeat_focus_or_lose_down_and_up() {
+        let (mut gate, mut shell, mut registry, messages) =
+            fixture(Some(InputIntentState::Command));
+        two_panes(&mut shell, false);
+        let hit = shell
+            .hits
+            .panes
+            .iter()
+            .find(|hit| hit.pane_id == "pane_2")
+            .unwrap()
+            .clone();
+        let now = Instant::now();
+        let mouse = |kind| {
+            RawInputEvent::Mouse(MouseEvent {
+                kind,
+                column: hit.inner_rect.x,
+                row: hit.inner_rect.y,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        gate.enqueue(
+            &mut shell,
+            &registry,
+            Vec::new(),
+            vec![
+                mouse(MouseEventKind::Down(MouseButton::Left)),
+                mouse(MouseEventKind::Up(MouseButton::Left)),
+            ],
+            None,
+            false,
+            now,
+        )
+        .unwrap();
+        applied(&mut gate);
+        let focus = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+        assert!(matches!(focus.actions.as_slice(),
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(request.method, crate::api::schema::Method::PaneFocus(_))));
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+        gate.complete(Completion {
+            authorization: gate.authorization.as_ref().unwrap().clone(),
+            result: Err(crate::client::ime_control::ImeError::WorkerStopped),
+        })
+        .unwrap();
+        two_panes(&mut shell, true);
+        while let Some(outcome) = dispatch(&mut gate, &mut shell, &mut registry, now) {
+            assert!(
+                outcome.actions.is_empty(),
+                "focus action must not be repeated"
+            );
+            send(&shell, &mut registry, outcome);
+        }
+        let kinds: Vec<_> = messages
+            .try_iter()
+            .flat_map(|message| match message {
+                ClientMessage::ClientShellPaneInput { pane_id, events } => {
+                    assert_eq!(pane_id, "pane_2");
+                    events
+                }
+                message => panic!("unexpected message: {message:?}"),
+            })
+            .map(|event| match event {
+                ClientPaneInputEvent::Mouse { kind, .. } => kind,
+                event => panic!("unexpected event: {event:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                crate::protocol::ClientMouseKind::Down(crate::protocol::ClientMouseButton::Left),
+                crate::protocol::ClientMouseKind::Up(crate::protocol::ClientMouseButton::Left),
+            ]
+        );
+        assert!(!gate.applied && gate.batches.is_empty());
+    }
+
+    #[test]
+    fn missing_capability_and_malformed_roster_disable_only_ime_before_first_key() {
+        for missing_capability in [false, true] {
+            let (mut gate, mut shell, mut registry, _messages) =
+                fixture(Some(InputIntentState::Command));
+            let (sender, messages) = mpsc::channel();
+            registry.insert(
+                ClientEndpointId::Local,
+                RecordingTransport(sender),
+                1,
+                if missing_capability {
+                    EndpointNegotiation::default()
+                } else {
+                    negotiation()
+                },
+                true,
+            );
+            if !missing_capability {
+                let mut snapshot = shell.snapshot.as_ref().unwrap().as_ref().clone();
+                snapshot.input_intents = None;
+                shell.set_endpoint_snapshot_for_generation(
+                    &ClientEndpointId::Local,
+                    1,
+                    Box::new(snapshot),
+                );
+            }
+            let now = Instant::now();
+            enqueue(&mut gate, &mut shell, &registry, b"x", now);
+            let outcome = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+            send(&shell, &mut registry, outcome);
+            assert!(matches!(messages.try_recv().unwrap(),
+                ClientMessage::ClientShellPaneInput { pane_id, events }
+                    if pane_id == "pane_1" && events.len() == 1));
+            assert!(registry.active_surface_available());
+            assert!(shell.endpoint_is_online(&ClientEndpointId::Local));
+            assert!(shell.endpoint_error.is_none() && shell.visible_endpoint_notice.is_none());
+            assert!(!gate.enabled() && gate.authorization.is_none());
+        }
     }
 
     #[test]
@@ -2166,22 +3244,18 @@ mod tests {
             gate.pending_plan.as_ref().unwrap().deadline,
             now + INPUT_WAIT
         );
-        assert!(matches!(
-            gate.dispatch(
-                &mut shell,
-                &mut registry,
-                false,
-                None,
-                false,
-                now + INPUT_WAIT
-            ),
-            Err(ClientError::ImeAckTimeout)
-        ));
+        let first = dispatch(&mut gate, &mut shell, &mut registry, now + INPUT_WAIT).unwrap();
+        assert!(!gate.enabled() && !gate.applied && gate.authorization.is_none());
+        assert_eq!(first.routed_requests.len(), 1);
+        let second = dispatch(&mut gate, &mut shell, &mut registry, now + INPUT_WAIT).unwrap();
+        assert_eq!(second.routed_requests.len(), 1);
+        assert!(gate.batches.is_empty() && gate.deadline().is_none());
     }
 
     #[test]
-    fn waiting_batch_and_byte_limits_reject_without_replacing_retained_input() {
-        let (mut gate, mut shell, registry, _) = fixture(Some(InputIntentState::Command));
+    fn waiting_batch_and_byte_limits_disable_enhancement_without_losing_the_trigger() {
+        let (mut gate, mut shell, mut registry, messages) =
+            fixture(Some(InputIntentState::Command));
         let now = Instant::now();
         for _ in 0..INPUT_BATCH_LIMIT {
             enqueue(&mut gate, &mut shell, &registry, b"x", now);
@@ -2195,13 +3269,43 @@ mod tests {
             false,
             now,
         );
-        assert!(matches!(extra, Err(ClientError::ImeInputOverflow)));
-        assert_eq!(gate.batches.len(), INPUT_BATCH_LIMIT);
-        assert!(gate.batches.iter().all(|batch| batch.raw == b"x"));
-        let (mut gate, mut shell, registry, _) = fixture(Some(InputIntentState::Command));
-        let key = || {
+        extra.unwrap();
+        assert!(!gate.enabled() && !gate.applied);
+        assert_eq!(gate.batches.len(), INPUT_BATCH_LIMIT + 1);
+        assert!(gate
+            .batches
+            .iter()
+            .take(INPUT_BATCH_LIMIT)
+            .all(|batch| batch.raw == b"x"));
+        assert_eq!(gate.batches.back().unwrap().raw, b"y");
+        while let Some(outcome) = dispatch(&mut gate, &mut shell, &mut registry, now) {
+            send(&shell, &mut registry, outcome);
+        }
+        let characters: Vec<_> = messages
+            .try_iter()
+            .flat_map(|message| match message {
+                ClientMessage::ClientShellPaneInput { events, .. } => events,
+                message => panic!("unexpected message: {message:?}"),
+            })
+            .map(|event| match event {
+                ClientPaneInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char(character),
+                    ..
+                } => character,
+                event => panic!("unexpected event: {event:?}"),
+            })
+            .collect();
+        assert_eq!(characters.len(), INPUT_BATCH_LIMIT + 1);
+        assert!(characters[..INPUT_BATCH_LIMIT]
+            .iter()
+            .all(|character| *character == 'x'));
+        assert_eq!(characters[INPUT_BATCH_LIMIT], 'y');
+        assert!(!gate.ready());
+        let (mut gate, mut shell, mut registry, messages) =
+            fixture(Some(InputIntentState::Command));
+        let key = |character| {
             RawInputEvent::Key(crate::input::TerminalKey::new(
-                KeyCode::Char('x'),
+                KeyCode::Char(character),
                 KeyModifiers::NONE,
             ))
         };
@@ -2209,7 +3313,7 @@ mod tests {
             &mut shell,
             &registry,
             vec![b'x'; INPUT_BYTE_LIMIT],
-            vec![key()],
+            vec![key('x')],
             None,
             false,
             now,
@@ -2219,14 +3323,35 @@ mod tests {
             &mut shell,
             &registry,
             vec![b'y'],
-            vec![key()],
+            vec![key('y')],
             None,
             false,
             now,
         );
-        assert!(matches!(extra, Err(ClientError::ImeInputOverflow)));
-        assert_eq!(gate.bytes, INPUT_BYTE_LIMIT);
-        assert_eq!(gate.batches.len(), 1);
+        extra.unwrap();
+        assert!(!gate.enabled() && !gate.applied);
+        assert_eq!(gate.bytes, INPUT_BYTE_LIMIT + 1);
+        assert_eq!(gate.batches.len(), 2);
+        assert_eq!(gate.batches.back().unwrap().raw, b"y");
+        while let Some(outcome) = dispatch(&mut gate, &mut shell, &mut registry, now) {
+            send(&shell, &mut registry, outcome);
+        }
+        let characters: Vec<_> = messages
+            .try_iter()
+            .flat_map(|message| match message {
+                ClientMessage::ClientShellPaneInput { events, .. } => events,
+                message => panic!("unexpected message: {message:?}"),
+            })
+            .map(|event| match event {
+                ClientPaneInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char(character),
+                    ..
+                } => character,
+                event => panic!("unexpected event: {event:?}"),
+            })
+            .collect();
+        assert_eq!(characters, vec!['x', 'y']);
+        assert!(!gate.ready());
     }
 
     #[test]
@@ -2270,6 +3395,13 @@ mod tests {
         applied(&mut gate);
         let press = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
         send(&shell, &mut registry, press);
+        gate.complete(Completion {
+            authorization: gate.authorization.as_ref().unwrap().clone(),
+            result: Err(crate::client::ime_control::ImeError::WorkerStopped),
+        })
+        .unwrap();
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+        assert!(!gate.enabled());
         let profile = SavedSshEndpoint {
             id: ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
             label: "remote".into(),
@@ -2702,12 +3834,12 @@ mod tests {
         assert!(dispatch(&mut gate, &mut shell, &mut registry, now).is_none());
     }
 
-    fn launch_test_popup(
+    fn stage_test_popup(
         gate: &mut ImeGate,
         shell: &mut ClientShellState,
         registry: &mut EndpointRegistry,
         now: Instant,
-    ) -> String {
+    ) {
         let binding = crate::config::CustomCommandKeybind {
             bindings: crate::config::ActionKeybinds::prefix("z"),
             label: "prefix+z".into(),
@@ -2738,6 +3870,15 @@ mod tests {
             "launch must not cancel its own pending request"
         );
         assert!(dispatch(gate, shell, registry, now).is_none());
+    }
+
+    fn launch_test_popup(
+        gate: &mut ImeGate,
+        shell: &mut ClientShellState,
+        registry: &mut EndpointRegistry,
+        now: Instant,
+    ) -> String {
+        stage_test_popup(gate, shell, registry, now);
         applied(gate);
         let launch = dispatch(gate, shell, registry, now).unwrap();
         assert!(matches!(launch.actions.as_slice(),
@@ -2748,6 +3889,66 @@ mod tests {
             ClientShellAction::Endpoint { request, .. } => request.id.clone(),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn failed_popup_ack_downgrades_only_unsent_request_and_keeps_exact_target() {
+        let (mut gate, mut shell, mut registry, messages) =
+            fixture(Some(InputIntentState::Command));
+        let now = Instant::now();
+        stage_test_popup(&mut gate, &mut shell, &mut registry, now);
+        let request_id = gate
+            .batches
+            .front()
+            .unwrap()
+            .pending_outcome
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                ClientShellAction::Endpoint { request, .. } => Some(request.id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        shell.set_endpoint_methods(Some(vec!["command.invoke".into()]));
+        gate.complete(Completion {
+            authorization: gate.authorization.as_ref().unwrap().clone(),
+            result: Err(crate::client::ime_control::ImeError::Daemon(
+                "backend_unavailable".into(),
+            )),
+        })
+        .unwrap();
+        let outcome = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+        assert!(matches!(outcome.actions.as_slice(),
+            [ClientShellAction::Endpoint { endpoint_id: ClientEndpointId::Local, boot_id, request }]
+                if boot_id == "boot-1" && request.id == request_id
+                    && matches!(&request.method, crate::api::schema::Method::CommandInvoke(params)
+                        if params.command_id == "cmd_popup"
+                            && params.workspace_id.as_deref() == Some("ws_1")
+                            && params.tab_id.as_deref() == Some("tab_1")
+                            && params.pane_id.as_deref() == Some("pane_1"))));
+        assert_eq!(
+            shell.pending_requests[&request_id].method_name,
+            "command.invoke"
+        );
+        assert!(dispatch(&mut gate, &mut shell, &mut registry, now).is_none());
+        shell.handle_endpoint_result(
+            "boot-1",
+            &request_id,
+            Ok(crate::api::schema::ResponseResult::Ok {}),
+        );
+        assert!(shell.popup_pending && shell.popup_pending_deadline.is_some());
+        popup_over_second_pane(&mut shell, None);
+        enqueue(&mut gate, &mut shell, &registry, b"x", now);
+        let input = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+        send(&shell, &mut registry, input);
+        assert!(matches!(messages.try_recv().unwrap(),
+            ClientMessage::ClientShellPopupInput { terminal_id, events }
+                if terminal_id == "terminal-popup" && events.len() == 1));
+        assert!(messages.try_recv().is_err());
+        assert!(shell.visible_endpoint_notice.is_none() && shell.ime_authorization.is_none());
+        assert!(!gate.enabled() && !gate.applied);
     }
 
     #[test]

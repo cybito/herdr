@@ -1526,7 +1526,7 @@
           "key": "experimental.ime_control",
           "type": "boolean",
           "default": "false",
-          "description": "实验性 pane/Popup command/text 意图：server 仅记录语义，聚焦 client 通过本机 ime-control 管理 lease。server 与 client 都须启用；text 释放暂态英文，不强制中文。开启时 prefix 使用同一 daemon，关闭时旧 direct-switch 行为不变。仅支持具备本机图形 ime-control 服务的 macOS/Linux client；recorded ACK 不表示本机切源完成。"
+          "description": "实验性 pane/Popup command/text 意图：server 仅记录语义，聚焦 client 通过本机 ime-control 管理 lease。server 与 client 都须启用；text 释放暂态英文，不强制中文。开启时 prefix 使用同一 daemon；本机图形环境、socket、daemon、后端、能力或 ACK 不可用时，本进程静默退化普通终端输入，不退出、不吞未发送输入、不弹 IME 通知，也不恢复旧 direct-switch。退化后的 Popup 使用 command.invoke。显式关闭配置时旧行为不变；recorded ACK 不表示本机切源完成。"
         },
         {
           "key": "experimental.switch_ascii_input_source_in_prefix",

@@ -21,12 +21,11 @@ pub enum ClientError {
     ConnectionLost(io::Error),
     /// Protocol error (framing, deserialization).
     Protocol(protocol::FramingError),
-    /// Enabled local IME control requires an explicitly advertised endpoint capability.
+    /// Optional local IME authorization requires an explicitly advertised capability.
     InputIntentUnsupported,
     /// The endpoint did not provide a complete current input-intent replacement.
     InputIntentProtocolError,
     ImeControl(super::ime_control::ImeError),
-    ImeInputOverflow,
     ImeAckTimeout,
 }
 
@@ -83,10 +82,6 @@ impl std::fmt::Display for ClientError {
             }
             ClientError::Protocol(err) => write!(f, "protocol error: {err}"),
             ClientError::ImeControl(error) => write!(f, "{error}"),
-            ClientError::ImeInputOverflow => write!(
-                f,
-                "IME_INPUT_OVERFLOW: waiting input exceeded 256 batches or 2 MiB"
-            ),
             ClientError::ImeAckTimeout => write!(
                 f,
                 "IME_ACK_TIMEOUT: input was not authorized within five seconds"

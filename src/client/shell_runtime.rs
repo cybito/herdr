@@ -74,15 +74,15 @@ pub(super) fn dispatch_client_shell_actions(
 pub(super) fn queue_mouse_replay(
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
     replay: shell::ClientMouseReplay,
-) -> Result<(), ClientError> {
-    event_tx
-        .try_send(ClientLoopEvent::ReplayMouse(replay))
-        .map_err(|error| match error {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => ClientError::ImeInputOverflow,
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => ClientError::ConnectionLost(
-                io::Error::new(io::ErrorKind::BrokenPipe, "client input loop closed"),
-            ),
-        })
+) -> Option<shell::ClientMouseReplay> {
+    match event_tx.try_send(ClientLoopEvent::ReplayMouse(replay)) {
+        Ok(()) => None,
+        Err(
+            tokio::sync::mpsc::error::TrySendError::Full(ClientLoopEvent::ReplayMouse(replay))
+            | tokio::sync::mpsc::error::TrySendError::Closed(ClientLoopEvent::ReplayMouse(replay)),
+        ) => Some(replay),
+        Err(_) => unreachable!("only a mouse replay was submitted"),
+    }
 }
 
 pub(super) fn client_shell_resize_message(
@@ -780,8 +780,11 @@ pub(super) fn finish_client_shell_input(
     } else {
         frame
     };
+    let mut immediate_replays = Vec::new();
     for replay in replay {
-        queue_mouse_replay(event_tx, replay)?;
+        if let Some(replay) = queue_mouse_replay(event_tx, replay) {
+            immediate_replays.push(replay);
+        }
     }
     for (route, request) in outcome.routed_requests {
         send_bound_input(state.shell.as_ref(), endpoints, &route, &request);
@@ -846,6 +849,29 @@ pub(super) fn finish_client_shell_input(
             state.present_frame(frame);
         } else {
             state.present_frozen_chrome(frame);
+        }
+    }
+    for replay in immediate_replays {
+        if let Some(shell) = state.shell.as_mut() {
+            let outcome =
+                shell.replay_mouse_without_ime(endpoints, replay, pending_activation.is_some());
+            let frame = outcome
+                .repaint
+                .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+                .flatten();
+            if finish_client_shell_input(
+                state,
+                outcome,
+                frame,
+                endpoints,
+                pending_activation,
+                endpoint_commands,
+                prefix_input_source,
+                scheduled_activation,
+                event_tx,
+            )? {
+                return Ok(true);
+            }
         }
     }
     Ok(false)

@@ -847,7 +847,7 @@ impl ClientShellState {
                     if button == gesture.button
             );
             if gesture_event {
-                if self.ime_control_enabled
+                if self.ime_control_requested
                     && !matches!(mouse.kind, MouseEventKind::Up(_))
                     && gesture.route.as_ref() != self.input_route.as_ref()
                 {
@@ -2254,7 +2254,7 @@ impl ClientShellState {
                             ));
                         }
                     }
-                    if !self.ime_control_enabled
+                    if !self.ime_control_requested
                         || self.focused_pane_id().as_deref() != Some(hit.pane_id.as_str())
                     {
                         self.push_endpoint_method(

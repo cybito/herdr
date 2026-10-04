@@ -228,7 +228,7 @@ fn worktree_create_cancelled_or_failed_request_never_focuses() {
 }
 
 #[test]
-fn missing_popup_receipt_capability_rejects_before_send_without_disconnecting() {
+fn missing_popup_receipt_capability_disables_ime_and_uses_ordinary_command_invoke() {
     let mut state = popup_state(true);
     state.set_endpoint_methods(Some(vec!["command.invoke".into()]));
     let mut outcome = ClientShellInput::default();
@@ -236,31 +236,14 @@ fn missing_popup_receipt_capability_rejects_before_send_without_disconnecting() 
         crate::input::KeybindMatch::Command(popup_binding()),
         &mut outcome,
     );
-    assert!(outcome.actions.is_empty());
     assert!(outcome.requests.is_empty());
-    assert!(outcome.repaint);
-    assert!(state.pending_requests.is_empty());
-    assert!(!state.popup_pending);
-    assert!(state.popup_pending_deadline.is_none());
-    assert!(state.popup_command_completion.is_none());
     assert!(state.endpoint_is_online(&ClientEndpointId::Local));
-    assert!(state.endpoint_error.is_none());
-    assert_eq!(
-        state.visible_endpoint_notice.as_ref().unwrap().key.kind,
-        ClientEndpointNoticeKind::Unsupported
-    );
-    assert!(matches!(
-        &state.handle_input_bytes(b"x").requests[..],
-        [ClientMessage::ClientShellPaneInput { .. }]
-    ));
-
-    state.ime_control_enabled = false;
-    let mut legacy = ClientShellInput::default();
-    state.record_binding(
-        crate::input::KeybindMatch::Command(popup_binding()),
-        &mut legacy,
-    );
-    let id = request_id(&legacy.actions);
+    assert!(state.endpoint_error.is_none() && state.visible_endpoint_notice.is_none());
+    assert!(!state.ime_control_enabled && state.ime_control_requested);
+    assert!(matches!(&outcome.actions[..],
+        [ClientShellAction::Endpoint { request, .. }]
+            if matches!(request.method, crate::api::schema::Method::CommandInvoke(_))));
+    let id = request_id(&outcome.actions);
     state.handle_endpoint_result("boot-1", id, Ok(crate::api::schema::ResponseResult::Ok {}));
     assert!(state.popup_pending);
     assert!(state.popup_pending_deadline.is_some());

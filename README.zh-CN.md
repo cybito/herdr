@@ -53,6 +53,12 @@ herdr
 
 运行你的智能体、分割窗格，然后安心离开。`ctrl+b q` 分离，`herdr` 重新连接。[快速开始 →](https://herdr.dev/zh-cn/docs/quick-start/)
 
+### 可选 IME 增强
+
+定制源码可通过 `[experimental] ime_control = true` 使用 pane/Popup 的输入意图与本机 `ime-control`。此功能不是终端输入的前提：本机图形会话、daemon、后端、可信 socket、端点能力或有效 ACK 不可用时，当前客户端静默关闭增强，继续普通终端输入；不会弹出 IME 通知、退出客户端或切换到旧 direct-switch 后端。尚未派发的当前输入及 FIFO 队列继续按原有路由处理，不重放已经消费的前缀键或命令；已发送按键/鼠标的 release 仍回到原 route。退化后的 Popup 使用普通 `command.invoke`，不要求 IME 专用回执，也不宣称英文保护已经生效。
+
+鼠标点击的焦点请求失败或没有对应投影时，等待也受原始 5 秒截止时间约束，即使 IME 已关闭也不会无限堵住输入队列。已发送的焦点请求不会重发；当前 click 的 down/drag/up 按普通终端路由处理，已开始手势的拖动与释放保留捕获的 route，原窗格捕获的键不会被改投新窗格，后续导航与分离仍可继续。可见窗格缺少 IME terminal identity 时只退出增强，不虚构身份或退出客户端。
+
 ## 文档
 
 所有文档都在 [herdr.dev/docs](https://herdr.dev/zh-cn/docs/)：[快速开始](https://herdr.dev/zh-cn/docs/quick-start/) · [核心概念](https://herdr.dev/zh-cn/docs/concepts/) · [受支持的智能体](https://herdr.dev/zh-cn/docs/agents/) · [键盘](https://herdr.dev/zh-cn/docs/keyboard/) · [配置](https://herdr.dev/zh-cn/docs/configuration/) · [会话状态](https://herdr.dev/zh-cn/docs/session-state/) · [连接机器](https://herdr.dev/zh-cn/docs/connecting-machines/) · [远程访问](https://herdr.dev/zh-cn/docs/persistence-remote/) · [集成](https://herdr.dev/zh-cn/docs/integrations/) · [插件](https://herdr.dev/zh-cn/docs/plugins/) · [socket api](https://herdr.dev/zh-cn/docs/socket-api/)

@@ -34,14 +34,10 @@ fn input_intent_registry(
 }
 
 #[test]
-fn enabled_input_rejects_an_unadvertised_endpoint_before_dispatch() {
-    let (mut state, _) = state_with_remote();
-    let registry = input_intent_registry(Default::default(), 1);
-    let input =
-        crate::client::shell_runtime::require_client_input_intents(Some(&state), &registry, true)
-            .map(|()| state.handle_input_bytes(b"x"));
+fn source_authorization_requires_an_explicit_endpoint_capability() {
+    let negotiation = crate::client::endpoint::EndpointNegotiation::default();
     assert!(matches!(
-        input,
+        negotiation.require_pane_input_intent(true),
         Err(crate::client::ClientError::InputIntentUnsupported)
     ));
 }

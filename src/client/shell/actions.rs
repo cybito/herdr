@@ -261,11 +261,22 @@ impl ClientShellState {
                 if action == crate::protocol::ClientShellCommandAction::Popup {
                     self.popup_pending = true;
                     self.popup_pending_deadline = None;
-                    let method = if self.ime_control_enabled {
+                    let mut method = if self.ime_control_enabled {
                         crate::api::schema::Method::CommandInvokeReceipt(params)
                     } else {
                         crate::api::schema::Method::CommandInvoke(params)
                     };
+                    if matches!(method, crate::api::schema::Method::CommandInvokeReceipt(_))
+                        && !self.supports_endpoint_method(&method)
+                    {
+                        self.disable_ime_control();
+                        method = match method {
+                            crate::api::schema::Method::CommandInvokeReceipt(params) => {
+                                crate::api::schema::Method::CommandInvoke(params)
+                            }
+                            _ => unreachable!("checked receipt method"),
+                        };
+                    }
                     if !self.push_endpoint_method_with_kind(
                         method,
                         PendingEndpointKind::PopupCommand,
@@ -373,6 +384,11 @@ impl ClientShellState {
         kind: PendingEndpointKind,
         outcome: &mut ClientShellInput,
     ) -> bool {
+        if self.suppress_mouse_focus_request
+            && matches!(method, crate::api::schema::Method::PaneFocus(_))
+        {
+            return true;
+        }
         let changes_focus = match &method {
             crate::api::schema::Method::WorkspaceFocus(_)
             | crate::api::schema::Method::TabFocus(_)
@@ -519,6 +535,15 @@ impl ClientShellState {
                 .is_none_or(|snapshot| snapshot.boot_id != boot_id)
         {
             return (false, Vec::new());
+        }
+        if let Some((_, failed)) = self
+            .mouse_focus_request
+            .as_mut()
+            .filter(|(focus_request, _)| {
+                pending.method_name == "pane.focus" && focus_request.as_ref() == request_id
+            })
+        {
+            *failed = result.is_err();
         }
         if let PendingEndpointKind::PaneLinkResolve { target } = pending.kind {
             return self.complete_link_hover(target, result);

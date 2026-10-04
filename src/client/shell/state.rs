@@ -957,8 +957,14 @@ pub(crate) struct ClientShellState {
     pub(super) host_mouse_pixels: Option<crate::input::mouse::HostPixels>,
     pub(super) input_leases: ClientInputLeases,
     pub(super) ime_control_enabled: bool,
+    /// The opt-in also suppresses the obsolete direct-switch backend after degradation.
+    pub(super) ime_control_requested: bool,
     pub(super) input_route: Option<std::sync::Arc<ClientInputRoute>>,
     pub(super) ime_forward_prefix: bool,
+    /// Correlates the staged Generic PaneFocus response; success still needs projection.
+    pub(super) mouse_focus_request: Option<(std::sync::Arc<str>, bool)>,
+    /// Event-scoped suppression for the focus proposal already dispatched by the gate.
+    pub(super) suppress_mouse_focus_request: bool,
     pub(super) ime_authorization:
         Option<std::sync::Arc<crate::client::ime_control::AuthorizationKey>>,
     pub(super) ime_input_deadline: Option<std::time::Instant>,
@@ -1129,8 +1135,11 @@ impl ClientShellState {
             host_mouse_pixels: None,
             input_leases: ClientInputLeases::default(),
             ime_control_enabled: false,
+            ime_control_requested: false,
             input_route: None,
             ime_forward_prefix: false,
+            mouse_focus_request: None,
+            suppress_mouse_focus_request: false,
             ime_authorization: None,
             ime_input_deadline: None,
             popup_pending: false,
@@ -1268,7 +1277,7 @@ impl ClientShellState {
         self.hits = ShellHitMap::default();
         self.pane_surface = None;
         self.pending_pane_surface = None;
-        if !self.ime_control_enabled {
+        if !self.ime_control_requested {
             self.input_leases = ClientInputLeases::default();
         }
         self.popup_terminal_id = None;
@@ -1306,7 +1315,7 @@ impl ClientShellState {
             .startup_onboarding
             .then_some(ClientShellOverlay::Onboarding);
         self.previous_pane_id = None;
-        if !self.ime_control_enabled {
+        if !self.ime_control_requested {
             self.pane_mouse_gesture = None;
         }
         self.link_hover = None;
@@ -1699,7 +1708,7 @@ impl ClientShellState {
             {
                 self.cancel_settings_overlay();
             }
-            if !self.ime_control_enabled {
+            if !self.ime_control_requested {
                 if let Some(terminal_id) = previous_popup.as_ref() {
                     self.input_leases
                         .remove_target(&ClientInputTarget::Popup(terminal_id.clone()));
@@ -1727,7 +1736,7 @@ impl ClientShellState {
             self.chrome_drag = None;
             self.workspace_press = None;
             self.tab_press = None;
-            if !self.ime_control_enabled
+            if !self.ime_control_requested
                 && self.pane_mouse_gesture.as_ref().is_some_and(|gesture| {
                     gesture.hit.popup
                         && previous_popup.as_deref() == Some(gesture.hit.pane_id.as_str())

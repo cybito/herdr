@@ -268,9 +268,6 @@ fn run_client_with_mode(
                 handshake.endpoint_methods.clone().unwrap_or_default(),
                 handshake.endpoint_capabilities.clone().unwrap_or_default(),
             );
-            negotiation
-                .require_pane_input_intent(loop_config.ime_control_enabled)
-                .map_err(io::Error::other)?;
             if federated && !negotiation.supports_surface_interest() {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -291,15 +288,7 @@ fn run_client_with_mode(
         .transpose();
     let initial = match initial {
         Ok(initial) => initial,
-        Err(error)
-            if federated
-                && !error.get_ref().is_some_and(|cause| {
-                    matches!(
-                        cause.downcast_ref::<ClientError>(),
-                        Some(ClientError::InputIntentUnsupported)
-                    )
-                }) =>
-        {
+        Err(error) if federated => {
             warn!(%error, "Local handshake failed; keeping saved machines available");
             None
         }
@@ -450,54 +439,6 @@ impl ClientEventScheduler {
     }
 }
 
-/// Reject only a selected endpoint; `Some` reports whether its active host effects must be cleared.
-fn reject_unsupported_ime_endpoint(
-    state: &mut ClientState,
-    endpoints: &mut endpoint::EndpointRegistry,
-    commands: &mut endpoint_commands::EndpointCommands,
-    supervisors: &mut endpoint::EndpointSupervisors,
-    pending: &mut Option<endpoint::PendingEndpointActivation>,
-    endpoint_id: &endpoint::ClientEndpointId,
-    ime_enabled: bool,
-    now: std::time::Instant,
-) -> Option<bool> {
-    let connection = endpoints.connection(endpoint_id)?;
-    let error = connection
-        .negotiation
-        .require_pane_input_intent(ime_enabled)
-        .err()?;
-    let generation = connection.generation;
-    warn!(endpoint = %endpoint_id.storage_key(), generation, %error, "endpoint input intent is unsupported");
-    let notice = (endpoints.active_id() != endpoint_id)
-        .then(|| {
-            state
-                .shell
-                .as_ref()
-                .map(|shell| format!("{}: {error}", shell.endpoint_label(endpoint_id)))
-        })
-        .flatten();
-    let active = handle_endpoint_attention(
-        state,
-        endpoints,
-        commands,
-        supervisors,
-        pending,
-        endpoint_id,
-        generation,
-        now,
-        error.to_string(),
-    );
-    if let Some(message) = notice {
-        if let Some(shell) = state.shell.as_mut() {
-            shell.receive_endpoint_unavailable(message);
-            if let Some(frame) = shell.compose(state.reported_size.0, state.reported_size.1) {
-                state.present_frame(frame);
-            }
-        }
-    }
-    Some(active)
-}
-
 // This guards server-supplied paths only. Client-owned temporary files generated
 // from received graphics bytes remain usable for remote endpoints.
 fn server_graphics_files_allowed(
@@ -624,16 +565,19 @@ async fn run_client_loop(
 
     // Channel for events from the resize and server reader threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
-    let mut ime_gate = if config.ime_control_enabled {
-        let shell = state
-            .shell
-            .as_mut()
-            .ok_or(ClientError::InputIntentProtocolError)?;
-        shell.enable_ime_control();
-        Some(shell::ImeGate::start(event_tx.clone())?)
-    } else {
-        None
-    };
+    let mut ime_gate = config
+        .ime_control_enabled
+        .then(|| {
+            state.shell.as_mut().map(|shell| {
+                shell.enable_ime_control();
+                let gate = shell::ImeGate::start(event_tx.clone());
+                if !gate.enabled() {
+                    shell.disable_ime_control();
+                }
+                gate
+            })
+        })
+        .flatten();
     let (supervisor_tx, mut supervisor_rx) =
         tokio::sync::mpsc::channel::<endpoint::EndpointSupervisorEvent>(64);
     // Keep Windows console draining independent of server-frame backpressure.
@@ -1010,8 +954,11 @@ async fn run_client_loop(
                 }
             }
             ClientLoopEvent::ImeControl(completion) => {
-                if let Some(gate) = ime_gate.as_mut() {
+                if let (Some(gate), Some(shell)) = (ime_gate.as_mut(), state.shell.as_mut()) {
                     gate.complete(completion)?;
+                    if !gate.enabled() {
+                        shell.disable_ime_control();
+                    }
                 }
             }
             ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
@@ -1029,23 +976,6 @@ async fn run_client_loop(
                             state.mouse_capture_active,
                             host_sgr_pixels_active.load(Ordering::Acquire),
                         );
-                    }
-                    if ime_gate.is_none()
-                        && events.iter().any(|event| {
-                            matches!(
-                                event,
-                                crate::raw_input::RawInputEvent::Key(_)
-                                    | crate::raw_input::RawInputEvent::Text(_)
-                                    | crate::raw_input::RawInputEvent::Paste(_)
-                                    | crate::raw_input::RawInputEvent::Mouse(_)
-                            )
-                        })
-                    {
-                        require_client_input_intents(
-                            state.shell.as_ref(),
-                            &write_stream,
-                            config.ime_control_enabled,
-                        )?;
                     }
                     if will_query_host_cell_size {
                         if let Some((width_px, height_px)) = reported_cell_size_from_events(&events)
@@ -1142,11 +1072,6 @@ async fn run_client_loop(
                     }
                     continue;
                 }
-                require_client_input_intents(
-                    state.shell.as_ref(),
-                    &write_stream,
-                    config.ime_control_enabled,
-                )?;
                 let data = if let Some(attach_escape) = &mut state.attach_escape {
                     match attach_escape.filter_input(
                         data,
@@ -1347,11 +1272,6 @@ async fn run_client_loop(
                     }
                     continue;
                 }
-                require_client_input_intents(
-                    state.shell.as_ref(),
-                    &write_stream,
-                    config.ime_control_enabled,
-                )?;
                 if state.shell.is_some() {
                     let (outcome, frame) = {
                         let shell = state.shell.as_mut().expect("checked shell mode");
@@ -1409,21 +1329,6 @@ async fn run_client_loop(
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
-                if events.iter().any(|event| {
-                    matches!(
-                        event,
-                        crate::protocol::ClientInputEvent::Key { .. }
-                            | crate::protocol::ClientInputEvent::TextCommit(_)
-                            | crate::protocol::ClientInputEvent::Paste { .. }
-                            | crate::protocol::ClientInputEvent::Mouse { .. }
-                    )
-                }) {
-                    require_client_input_intents(
-                        state.shell.as_ref(),
-                        &write_stream,
-                        config.ime_control_enabled,
-                    )?;
-                }
                 let image_bridge_active = endpoint_accepts_local_images(
                     is_remote_client,
                     write_stream.active_id(),
@@ -1656,25 +1561,6 @@ async fn run_client_loop(
                 target,
                 force,
             } => {
-                if let Some(active) = reject_unsupported_ime_endpoint(
-                    &mut state,
-                    &mut write_stream,
-                    &mut endpoint_commands,
-                    &mut supervisors,
-                    &mut pending_activation,
-                    &endpoint_id,
-                    config.ime_control_enabled,
-                    now,
-                ) {
-                    if active {
-                        clear_endpoint_host_effects(
-                            &mut state,
-                            &host_mouse_capture_active,
-                            &host_sgr_pixels_active,
-                        );
-                    }
-                    continue;
-                }
                 if !endpoint_catalog.select_endpoint(&endpoint_id) {
                     continue;
                 }
@@ -2223,13 +2109,24 @@ async fn run_client_loop(
                             }
                         } else {
                             for replay in replay_mouse {
-                                if ime_gate.is_some() {
-                                    queue_mouse_replay(&event_tx, replay)?;
+                                let replay = if let Some(ime_gate) = ime_gate.as_mut() {
+                                    let Some(replay) = queue_mouse_replay(&event_tx, replay) else {
+                                        continue;
+                                    };
+                                    ime_gate.disable();
+                                    replay
                                 } else {
+                                    replay
+                                };
+                                {
                                     let (outcome, frame) = {
                                         let shell =
                                             state.shell.as_mut().expect("shell endpoint response");
-                                        let mut outcome = shell.replay_mouse_events(replay.events);
+                                        let mut outcome = shell.replay_mouse_without_ime(
+                                            &write_stream,
+                                            replay,
+                                            pending_activation.is_some(),
+                                        );
                                         outcome.repaint |= repaint;
                                         let frame = outcome
                                             .repaint
@@ -2424,19 +2321,24 @@ async fn run_client_loop(
                             }
                         };
                         if let Some(connection) = write_stream.connection(&endpoint_id) {
-                            if let Some(shell) = state.shell.as_ref() {
-                                if !shell.validate_endpoint_input_intents(
+                            if let Some(shell) = state.shell.as_mut() {
+                                match shell.validate_endpoint_input_intents(
                                     &endpoint_id,
                                     generation,
                                     &snapshot,
                                     &connection.negotiation,
-                                )? {
-                                    continue;
+                                ) {
+                                    Ok(false) => continue,
+                                    Ok(true) => {}
+                                    Err(_) => {
+                                        // Missing optional IME metadata retires only
+                                        // this client's enhancement, not the endpoint.
+                                        if let Some(gate) = ime_gate.as_mut() {
+                                            gate.disable();
+                                        }
+                                        shell.disable_ime_control();
+                                    }
                                 }
-                            } else if connection.negotiation.supports_pane_input_intent()
-                                && snapshot.input_intents.is_none()
-                            {
-                                return Err(ClientError::InputIntentProtocolError);
                             }
                         }
                         let projection_pending = activation_message;
