@@ -67,6 +67,8 @@ pub enum Method {
     ReleaseNotesDismiss(ReleaseNotesDismissParams),
     #[serde(rename = "command.invoke")]
     CommandInvoke(CommandInvokeParams),
+    #[serde(rename = "command.invoke_receipt")]
+    CommandInvokeReceipt(CommandInvokeParams),
     #[serde(rename = "client.window_title.set")]
     ClientWindowTitleSet(ClientWindowTitleSetParams),
     #[serde(rename = "client.window_title.clear")]

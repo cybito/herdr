@@ -401,6 +401,7 @@ new_tab = "prefix+n"
 #[test]
 fn custom_binding_invokes_only_the_endpoint_manifest_id() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.enable_ime_control();
     let binding = crate::config::CustomCommandKeybind {
         bindings: crate::config::ActionKeybinds::prefix("z"),
         label: "prefix+z".into(),
@@ -421,6 +422,7 @@ fn custom_binding_invokes_only_the_endpoint_manifest_id() {
             description: None,
         });
     state.set_snapshot(Box::new(projection));
+    state.set_endpoint_methods(Some(vec!["command.invoke".into()]));
 
     let mut outcome = ClientShellInput::default();
     state.record_binding(crate::input::KeybindMatch::Command(binding), &mut outcome);
@@ -444,6 +446,7 @@ fn custom_binding_invokes_only_the_endpoint_manifest_id() {
 #[test]
 fn plugin_command_carries_client_owned_selection_coordinates() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.enable_ime_control();
     let binding = crate::config::CustomCommandKeybind {
         bindings: crate::config::ActionKeybinds::prefix("p"),
         label: "prefix+p".into(),
@@ -464,6 +467,7 @@ fn plugin_command_carries_client_owned_selection_coordinates() {
             description: None,
         });
     state.set_snapshot(Box::new(projection));
+    state.set_endpoint_methods(Some(vec!["command.invoke".into()]));
     let mut pane_surface = surface();
     pane_surface.panes[0].content_revision = 42;
     state.set_pane_surface(pane_surface);

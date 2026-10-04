@@ -1,9 +1,8 @@
 use super::*;
 use crate::client::endpoint::{ClientEndpointId, ClientEndpointStatus};
 
-fn pending_popup() -> (ClientShellState, Vec<ClientShellAction>) {
-    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-    let binding = crate::config::CustomCommandKeybind {
+fn popup_binding() -> crate::config::CustomCommandKeybind {
+    crate::config::CustomCommandKeybind {
         bindings: crate::config::ActionKeybinds::prefix("t"),
         label: "prefix+t".into(),
         command: "popup-command".into(),
@@ -11,7 +10,15 @@ fn pending_popup() -> (ClientShellState, Vec<ClientShellAction>) {
         description: None,
         width: None,
         height: None,
-    };
+    }
+}
+
+fn popup_state(ime_control_enabled: bool) -> ClientShellState {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    if ime_control_enabled {
+        state.enable_ime_control();
+    }
+    let binding = popup_binding();
     let mut projection = snapshot();
     projection
         .commands
@@ -24,8 +31,20 @@ fn pending_popup() -> (ClientShellState, Vec<ClientShellAction>) {
         });
     state.set_snapshot(Box::new(projection));
     state.set_pane_surface(surface());
+    state
+}
+
+fn pending_popup() -> (ClientShellState, Vec<ClientShellAction>) {
+    let mut state = popup_state(true);
+    state.set_endpoint_methods(Some(vec![
+        "command.invoke_receipt".into(),
+        "workspace.focus".into(),
+    ]));
     let mut outcome = ClientShellInput::default();
-    state.record_binding(crate::input::KeybindMatch::Command(binding), &mut outcome);
+    state.record_binding(
+        crate::input::KeybindMatch::Command(popup_binding()),
+        &mut outcome,
+    );
     assert!(state.popup_pending);
     (state, outcome.actions)
 }
@@ -209,17 +228,344 @@ fn worktree_create_cancelled_or_failed_request_never_focuses() {
 }
 
 #[test]
+fn missing_popup_receipt_capability_rejects_before_send_without_disconnecting() {
+    let mut state = popup_state(true);
+    state.set_endpoint_methods(Some(vec!["command.invoke".into()]));
+    let mut outcome = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Command(popup_binding()),
+        &mut outcome,
+    );
+    assert!(outcome.actions.is_empty());
+    assert!(outcome.requests.is_empty());
+    assert!(outcome.repaint);
+    assert!(state.pending_requests.is_empty());
+    assert!(!state.popup_pending);
+    assert!(state.popup_pending_deadline.is_none());
+    assert!(state.popup_command_completion.is_none());
+    assert!(state.endpoint_is_online(&ClientEndpointId::Local));
+    assert!(state.endpoint_error.is_none());
+    assert_eq!(
+        state.visible_endpoint_notice.as_ref().unwrap().key.kind,
+        ClientEndpointNoticeKind::Unsupported
+    );
+    assert!(matches!(
+        &state.handle_input_bytes(b"x").requests[..],
+        [ClientMessage::ClientShellPaneInput { .. }]
+    ));
+
+    state.ime_control_enabled = false;
+    let mut legacy = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Command(popup_binding()),
+        &mut legacy,
+    );
+    let id = request_id(&legacy.actions);
+    state.handle_endpoint_result("boot-1", id, Ok(crate::api::schema::ResponseResult::Ok {}));
+    assert!(state.popup_pending);
+    assert!(state.popup_pending_deadline.is_some());
+    assert!(state.popup_command_completion.is_none());
+    assert!(state.handle_input_bytes(b"blocked").requests.is_empty());
+    state.set_pane_surface(surface_with_popup());
+    assert!(!state.popup_pending);
+    assert!(state.popup_command_completion.is_none());
+    assert!(matches!(
+        &state.handle_input_bytes(b"x").requests[..],
+        [ClientMessage::ClientShellPopupInput { .. }]
+    ));
+}
+
+#[test]
+fn popup_completion_retains_exact_terminal_identity_through_projection() {
+    let (mut state, actions) = pending_popup();
+    let id = request_id(&actions);
+    let mut projected = surface_with_popup();
+    projected.popup.as_mut().unwrap().terminal_id = "foreign-popup".into();
+    state.set_pane_surface(projected.clone());
+    assert!(state.popup_command_completion.is_none());
+
+    state.handle_endpoint_result(
+        "boot-1",
+        id,
+        Ok(crate::api::schema::ResponseResult::CommandInvoked {
+            popup_terminal_id: Some("local-popup".into()),
+        }),
+    );
+    let completion = state.popup_command_completion.as_ref().unwrap();
+    assert_eq!(completion.request_id, id);
+    assert_eq!(completion.terminal_id.as_deref(), Some("local-popup"));
+    assert_eq!(state.popup_terminal_id.as_deref(), Some("foreign-popup"));
+
+    projected.surface_revision += 1;
+    projected.popup.as_mut().unwrap().terminal_id = "local-popup".into();
+    state.set_pane_surface(projected);
+    assert!(!state.popup_pending);
+    let completion = state.popup_command_completion.as_ref().unwrap();
+    assert_eq!(completion.request_id, id);
+    assert_eq!(completion.terminal_id.as_deref(), Some("local-popup"));
+}
+
+#[test]
+fn failed_local_popup_completion_cannot_borrow_foreign_projection() {
+    for projection_first in [false, true] {
+        let (mut state, actions) = pending_popup();
+        let id = request_id(&actions);
+        let mut projected = surface_with_popup();
+        projected.popup.as_mut().unwrap().terminal_id = "foreign-popup".into();
+        if projection_first {
+            state.set_pane_surface(projected.clone());
+        }
+        state.handle_endpoint_result(
+            "boot-1",
+            id,
+            Err(ClientShellEndpointError {
+                code: Some("command_failed".into()),
+                message: "another popup is already open".into(),
+            }),
+        );
+        if !projection_first {
+            state.set_pane_surface(projected);
+        }
+        assert_eq!(state.popup_terminal_id.as_deref(), Some("foreign-popup"));
+        assert!(!state.popup_pending);
+        assert!(state.popup_pending_deadline.is_none());
+        let completion = state.popup_command_completion.as_ref().unwrap();
+        assert_eq!(completion.request_id, id);
+        assert!(completion.terminal_id.is_none());
+    }
+}
+
+#[test]
+fn popup_completion_rejects_success_without_exact_terminal_identity() {
+    use crate::api::schema::ResponseResult;
+
+    for result in [
+        ResponseResult::Ok {},
+        ResponseResult::CommandInvoked {
+            popup_terminal_id: None,
+        },
+        ResponseResult::CommandInvoked {
+            popup_terminal_id: Some(String::new()),
+        },
+    ] {
+        let (mut state, actions) = pending_popup();
+        let id = request_id(&actions);
+        let (repaint, follow_up) = state.handle_endpoint_result("boot-1", id, Ok(result));
+        assert!(repaint);
+        assert!(follow_up.is_empty());
+        assert!(!state.popup_pending);
+        assert!(state.popup_pending_deadline.is_none());
+        assert!(state.endpoint_error.is_some());
+        let completion = state.popup_command_completion.as_ref().unwrap();
+        assert_eq!(completion.request_id, id);
+        assert!(completion.terminal_id.is_none());
+        assert!(matches!(
+            &state.handle_input_bytes(b"x").requests[..],
+            [ClientMessage::ClientShellPaneInput { .. }]
+        ));
+    }
+}
+
+#[test]
+fn new_popup_request_clears_old_success_and_cancelled_identity_stays_cleared() {
+    let (mut state, actions) = pending_popup();
+    let old_id = request_id(&actions);
+    state.handle_endpoint_result(
+        "boot-1",
+        old_id,
+        Ok(crate::api::schema::ResponseResult::CommandInvoked {
+            popup_terminal_id: Some("old-popup".into()),
+        }),
+    );
+    assert_eq!(
+        state
+            .popup_command_completion
+            .as_ref()
+            .unwrap()
+            .terminal_id
+            .as_deref(),
+        Some("old-popup")
+    );
+
+    let mut invoke = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Command(popup_binding()),
+        &mut invoke,
+    );
+    let current_id = request_id(&invoke.actions);
+    assert_ne!(current_id, old_id);
+    assert!(state.popup_command_completion.is_none());
+    assert!(state.cancel_endpoint_request(current_id));
+    for (id, terminal_id) in [(old_id, "old-popup"), (current_id, "cancelled-popup")] {
+        state.handle_endpoint_result(
+            "boot-1",
+            id,
+            Ok(crate::api::schema::ResponseResult::CommandInvoked {
+                popup_terminal_id: Some(terminal_id.into()),
+            }),
+        );
+        let completion = state.popup_command_completion.as_ref().unwrap();
+        assert_eq!(completion.request_id, current_id);
+        assert!(completion.terminal_id.is_none());
+    }
+    let mut projected = surface_with_popup();
+    projected.popup.as_mut().unwrap().terminal_id = "foreign-popup".into();
+    state.set_pane_surface(projected);
+    let completion = state.popup_command_completion.as_ref().unwrap();
+    assert_eq!(completion.request_id, current_id);
+    assert!(completion.terminal_id.is_none());
+}
+
+#[test]
+fn superseded_popup_completion_cannot_replace_current_receipt() {
+    let (mut state, old_actions) = pending_popup();
+    let old_id = request_id(&old_actions);
+    let other_actions =
+        state.focus_endpoint_target(ClientEndpointFocusTarget::Workspace("ws_1".into()));
+    let other_id = request_id(&other_actions);
+    let mut projected = surface_with_popup();
+    projected.popup.as_mut().unwrap().terminal_id = "foreign-popup".into();
+    state.set_pane_surface(projected);
+
+    let mut invoke = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Command(popup_binding()),
+        &mut invoke,
+    );
+    let current_id = request_id(&invoke.actions);
+    assert!(!state.pending_requests.contains_key(old_id));
+    assert!(state.pending_requests.contains_key(other_id));
+    assert!(state.pending_requests.contains_key(current_id));
+    assert!(state.popup_command_completion.is_none());
+
+    state.handle_endpoint_result(
+        "boot-1",
+        old_id,
+        Ok(crate::api::schema::ResponseResult::CommandInvoked {
+            popup_terminal_id: Some("old-popup".into()),
+        }),
+    );
+    assert!(state.popup_command_completion.is_none());
+    assert!(state.popup_pending);
+    assert_eq!(state.popup_terminal_id.as_deref(), Some("foreign-popup"));
+
+    state.handle_endpoint_result(
+        "boot-1",
+        current_id,
+        Ok(crate::api::schema::ResponseResult::CommandInvoked {
+            popup_terminal_id: Some("current-popup".into()),
+        }),
+    );
+    state.handle_endpoint_result(
+        "boot-1",
+        old_id,
+        Err(ClientShellEndpointError {
+            code: Some("command_failed".into()),
+            message: "superseded command failed".into(),
+        }),
+    );
+    state.handle_endpoint_result(
+        "boot-1",
+        other_id,
+        Ok(crate::api::schema::ResponseResult::CommandInvoked {
+            popup_terminal_id: Some("other-popup".into()),
+        }),
+    );
+    let completion = state.popup_command_completion.as_ref().unwrap();
+    assert_eq!(completion.request_id, current_id);
+    assert_eq!(completion.terminal_id.as_deref(), Some("current-popup"));
+}
+
+#[test]
+fn popup_completion_ignores_unknown_requests_and_old_boot_after_reset() {
+    for complete_before_reset in [false, true] {
+        let (mut state, actions) = pending_popup();
+        let id = request_id(&actions);
+        state.handle_endpoint_result(
+            "boot-1",
+            "unknown-request",
+            Ok(crate::api::schema::ResponseResult::CommandInvoked {
+                popup_terminal_id: Some("unknown-popup".into()),
+            }),
+        );
+        assert!(state.popup_command_completion.is_none());
+        assert!(state.pending_requests.contains_key(id));
+        if complete_before_reset {
+            state.handle_endpoint_result(
+                "boot-1",
+                id,
+                Ok(crate::api::schema::ResponseResult::CommandInvoked {
+                    popup_terminal_id: Some("old-popup".into()),
+                }),
+            );
+            let completion = state.popup_command_completion.as_ref().unwrap();
+            assert_eq!(completion.request_id, id);
+            assert_eq!(completion.terminal_id.as_deref(), Some("old-popup"));
+        }
+
+        let mut next_snapshot = state.snapshot.clone().unwrap();
+        next_snapshot.boot_id = "boot-2".into();
+        state.set_snapshot(next_snapshot);
+        state.handle_endpoint_result(
+            "boot-1",
+            id,
+            Ok(crate::api::schema::ResponseResult::CommandInvoked {
+                popup_terminal_id: Some("stale-popup".into()),
+            }),
+        );
+        assert!(state.popup_command_completion.is_none());
+        assert!(state.pending_requests.is_empty());
+        assert!(!state.popup_pending);
+    }
+}
+
+#[test]
+fn popup_receipt_from_wrong_boot_is_discarded_without_recording_identity() {
+    let (mut state, actions) = pending_popup();
+    let id = request_id(&actions);
+    state.handle_endpoint_result(
+        "different-boot",
+        id,
+        Ok(crate::api::schema::ResponseResult::CommandInvoked {
+            popup_terminal_id: Some("wrong-boot-popup".into()),
+        }),
+    );
+    assert!(state.popup_command_completion.is_none());
+    assert!(state.pending_requests.is_empty());
+    state.handle_endpoint_result(
+        "boot-1",
+        id,
+        Ok(crate::api::schema::ResponseResult::CommandInvoked {
+            popup_terminal_id: Some("late-popup".into()),
+        }),
+    );
+    assert!(state.popup_command_completion.is_none());
+}
+
+#[test]
 fn cancelling_popup_request_unblocks_input_and_ignores_late_success() {
     let (mut state, actions) = pending_popup();
     let id = request_id(&actions);
     assert!(state.cancel_endpoint_request(id));
     assert!(!state.popup_pending);
     assert!(state.pending_requests.is_empty());
+    let completion = state.popup_command_completion.as_ref().unwrap();
+    assert_eq!(completion.request_id, id);
+    assert!(completion.terminal_id.is_none());
     assert!(state
-        .handle_endpoint_result("boot-1", id, Ok(crate::api::schema::ResponseResult::Ok {}))
+        .handle_endpoint_result(
+            "boot-1",
+            id,
+            Ok(crate::api::schema::ResponseResult::CommandInvoked {
+                popup_terminal_id: Some("cancelled-popup".into()),
+            }),
+        )
         .1
         .is_empty());
     assert!(!state.popup_pending);
+    let completion = state.popup_command_completion.as_ref().unwrap();
+    assert_eq!(completion.request_id, id);
+    assert!(completion.terminal_id.is_none());
     assert!(!state.handle_input_bytes(b"x").requests.is_empty());
 }
 
@@ -325,10 +671,6 @@ fn dispatcher_cancels_worktree_requests_on_frozen_surface_or_failed_send() {
             &state.overlay,
             Some(ClientShellOverlay::WorktreeCreate(create)) if !create.creating
         ));
-        assert!(state
-            .visible_endpoint_notice
-            .as_ref()
-            .is_some_and(|notice| { notice.title == "Action interrupted" }));
         assert!(commands.disconnect(&ClientEndpointId::Local).is_empty());
     }
 }

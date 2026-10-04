@@ -23,6 +23,13 @@ struct InputBinding {
     focus_epoch: u64,
 }
 
+// Provenance of a still-live, locally requested popup, not source permission.
+struct LocalPopup {
+    parent: Arc<ClientInputRoute>,
+    request_id: String,
+    terminal: Option<Arc<str>>,
+}
+
 struct InputBatch {
     // Retain the original allocation for image-paste/file-drop recognition. Events move
     // out of their parser allocation; advancing never reparses or replays a trigger.
@@ -60,6 +67,7 @@ pub(in crate::client) struct ImeGate {
     focused: bool,
     episode: bool,
     binding: Option<InputBinding>,
+    local_popup: Option<LocalPopup>,
     sample_pending: bool,
     authorization: Option<Arc<AuthorizationKey>>,
     desired: Option<DesiredLease>,
@@ -105,6 +113,7 @@ impl ImeGate {
             focused: true,
             episode: true,
             binding: None,
+            local_popup: None,
             authorization: None,
             desired: None,
             sample_pending: true,
@@ -608,6 +617,84 @@ impl ImeGate {
         }
     }
 
+    fn invalidate_local_popup(&mut self, shell: &mut ClientShellState) {
+        self.local_popup = None;
+        self.episode = false;
+        self.sample_pending = false;
+        self.authorization = None;
+        self.cancel(shell);
+    }
+
+    fn local_popup_transition(
+        &mut self,
+        shell: &mut ClientShellState,
+        binding: Option<&InputBinding>,
+    ) -> (bool, bool) {
+        let Some(popup) = self.local_popup.as_mut() else {
+            return (false, false);
+        };
+        let Some(next) = binding.filter(|next| {
+            next.route.endpoint_id == popup.parent.endpoint_id
+                && next.route.connection_generation == popup.parent.connection_generation
+                && next.route.boot_id == popup.parent.boot_id
+        }) else {
+            self.local_popup = None;
+            return (false, false);
+        };
+        let staged = self
+            .batches
+            .front()
+            .and_then(|batch| batch.pending_outcome.as_ref())
+            .is_some_and(|outcome| {
+                outcome.actions.iter().any(|action| {
+                    matches!(action, ClientShellAction::Endpoint { request, .. }
+                    if request.id == popup.request_id)
+                })
+            });
+        let receipt = shell
+            .popup_command_completion
+            .as_ref()
+            .filter(|receipt| receipt.request_id == popup.request_id);
+        if staged {
+            return (self.episode, false);
+        }
+        let Some(receipt) = receipt else {
+            if shell.pending_requests.contains_key(&popup.request_id) {
+                return (self.episode, true);
+            }
+            self.invalidate_local_popup(shell);
+            return (false, false);
+        };
+        let Some(terminal) = receipt.terminal_id.as_ref() else {
+            self.invalidate_local_popup(shell);
+            return (false, false);
+        };
+        if shell.popup_terminal_id.as_deref() == Some(terminal.as_ref())
+            && next.terminal.as_ref() == Some(terminal)
+        {
+            if popup.terminal.is_none() {
+                popup.terminal = Some(terminal.clone());
+                self.authorization = None;
+                self.sample_pending = self.episode;
+            }
+            return (self.episode, false);
+        }
+        let returning = popup.terminal.as_ref().is_some_and(|terminal| {
+            self.binding.as_ref().and_then(|old| old.terminal.as_ref()) == Some(terminal)
+                && shell.popup_terminal_id.is_none()
+                && next.route == popup.parent
+        });
+        if returning {
+            self.local_popup = None;
+            return (self.episode, false);
+        }
+        if popup.terminal.is_none() && next.popup_pending {
+            return (self.episode, true);
+        }
+        self.invalidate_local_popup(shell);
+        (false, false)
+    }
+
     pub(in crate::client) fn synchronize(
         &mut self,
         shell: &mut ClientShellState,
@@ -629,19 +716,80 @@ impl ImeGate {
         } else {
             self.physical_binding(shell, endpoints)
         };
+        let (popup_continuation, popup_waiting) =
+            self.local_popup_transition(shell, binding.as_ref());
         if self.binding != binding {
+            // A popup launch already consumed its trigger and occluded the
+            // parent locally. Keep only that command for its new ACK; this is
+            // not permission to replay old-target input or cross a reconnect.
+            let popup_launch = !focus_changed
+                && focused
+                && self.binding.as_ref().zip(binding.as_ref()).is_some_and(|(old, next)| {
+                    !old.popup_pending
+                        && old.terminal.is_some()
+                        && next.popup_pending
+                        && old.focus_epoch == next.focus_epoch
+                        && old.route.endpoint_id == next.route.endpoint_id
+                        && old.route.connection_generation == next.route.connection_generation
+                        && old.route.boot_id == next.route.boot_id
+                })
+                && self.batches.front().and_then(|batch| batch.pending_outcome.as_ref())
+                    .is_some_and(|outcome| outcome.actions.iter().any(|action| {
+                        matches!(action, ClientShellAction::Endpoint { request, .. }
+                            if shell.pending_requests.get(&request.id)
+                                .is_some_and(|pending| matches!(pending.kind, PendingEndpointKind::PopupCommand)))
+                    }));
             let mouse_focus = !focus_changed
                 && focused
                 && binding
                     .as_ref()
                     .is_some_and(|binding| self.commit_mouse_focus(shell, binding));
-            if !mouse_focus {
+            if popup_launch {
+                let request_id =
+                    self.batches
+                        .front()
+                        .unwrap()
+                        .pending_outcome
+                        .as_ref()
+                        .unwrap()
+                        .actions
+                        .iter()
+                        .find_map(|action| match action {
+                            ClientShellAction::Endpoint { request, .. }
+                                if shell.pending_requests.get(&request.id).is_some_and(
+                                    |pending| {
+                                        matches!(pending.kind, PendingEndpointKind::PopupCommand)
+                                    },
+                                ) =>
+                            {
+                                Some(request.id.clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                self.local_popup = Some(LocalPopup {
+                    parent: self.binding.as_ref().unwrap().route.clone(),
+                    request_id,
+                    terminal: None,
+                });
+                let mut command = self.batches.pop_front().unwrap();
+                let discarded = !command.events.is_empty();
+                for event in command.events.drain(..) {
+                    Self::flush_balancing_release(shell, &event, &mut self.pending_releases);
+                }
+                self.cancel(shell);
+                self.report_cancelled(shell, usize::from(discarded));
+                command.binding = binding.as_ref().unwrap().clone();
+                self.bytes = command.raw.len();
+                self.batches.push_front(command);
+            } else if !mouse_focus {
                 self.cancel(shell);
             }
-            // A snapshot/boot/target change is not a keyboard/focus episode.
+            // Only consumed local triggers or real focus may start an episode.
             self.authorization = None;
-            self.episode = mouse_focus || (focus_changed && focused);
-            self.sample_pending = mouse_focus || (focus_changed && focused);
+            self.episode =
+                popup_launch || popup_continuation || mouse_focus || (focus_changed && focused);
+            self.sample_pending = self.episode && !popup_waiting;
             self.binding = binding;
             self.unreported = self.binding.as_ref().and_then(|binding| {
                 binding.terminal.as_ref().map(|terminal| {
@@ -660,6 +808,7 @@ impl ImeGate {
             .batches
             .front()
             .is_some_and(|batch| batch.focus_target.is_some());
+        self.waiting_target |= popup_waiting;
         let event = self.batches.front().and_then(|batch| batch.events.front());
         let pending_action = self
             .batches
@@ -752,6 +901,18 @@ impl ImeGate {
             shell.overlay.as_ref().map(ClientShellOverlay::kind),
             shell.modal_paste_target_active(),
         );
+        // A new foreground declaration within the current genuine episode
+        // needs its initial source sample before the application's first key.
+        // Metadata must never establish an episode after pause or reconnect.
+        if self.episode
+            && desired.as_ref().is_some_and(|next| {
+                self.desired.as_ref().is_none_or(|previous| {
+                    previous.identity != next.identity || previous.policy != next.policy
+                })
+            })
+        {
+            self.sample_pending = true;
+        }
         let same = self.authorization.as_ref().is_some_and(|authorization| {
             authorization.identity == identity
                 && authorization.intent_generation == generation
@@ -2405,6 +2566,237 @@ mod tests {
         assert!(dispatch(&mut gate, &mut shell, &mut registry, now).is_none());
     }
 
+    fn launch_test_popup(
+        gate: &mut ImeGate,
+        shell: &mut ClientShellState,
+        registry: &mut EndpointRegistry,
+        now: Instant,
+    ) -> String {
+        let binding = crate::config::CustomCommandKeybind {
+            bindings: crate::config::ActionKeybinds::prefix("z"),
+            label: "prefix+z".into(),
+            command: "popup-command".into(),
+            action: crate::config::CustomCommandAction::Popup,
+            description: None,
+            width: None,
+            height: None,
+        };
+        let mut snapshot = shell.snapshot.as_ref().unwrap().as_ref().clone();
+        snapshot.commands.push(crate::protocol::ClientShellCommand {
+            command_id: "cmd_popup".into(),
+            binding_label: binding.label.clone(),
+            binding_labels: binding.bindings.labels(),
+            action: crate::protocol::ClientShellCommandAction::Popup,
+            description: None,
+        });
+        shell.set_endpoint_snapshot_for_generation(&ClientEndpointId::Local, 1, Box::new(snapshot));
+        shell.config.keybinds.keybinds.custom_commands.push(binding);
+        enqueue(gate, shell, registry, b"\x02z", now);
+        applied(gate);
+        dispatch(gate, shell, registry, now).unwrap();
+        gate.synchronize(shell, registry, false, now).unwrap();
+        applied(gate);
+        dispatch(gate, shell, registry, now).unwrap();
+        assert!(
+            shell.popup_pending,
+            "launch must not cancel its own pending request"
+        );
+        assert!(dispatch(gate, shell, registry, now).is_none());
+        applied(gate);
+        let launch = dispatch(gate, shell, registry, now).unwrap();
+        assert!(matches!(launch.actions.as_slice(),
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(request.method, crate::api::schema::Method::CommandInvokeReceipt(_))));
+        assert!(gate.batches.is_empty());
+        match &launch.actions[0] {
+            ClientShellAction::Endpoint { request, .. } => request.id.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn popup_launch_waits_for_its_own_authorization_without_cancelling_itself() {
+        let (mut gate, mut shell, mut registry, _) = fixture(Some(InputIntentState::Command));
+        let now = Instant::now();
+        let request_id = launch_test_popup(&mut gate, &mut shell, &mut registry, now);
+        let boot_id = gate.binding.as_ref().unwrap().route.boot_id.to_string();
+        shell.handle_endpoint_result(
+            &boot_id,
+            &request_id,
+            Ok(crate::api::schema::ResponseResult::CommandInvoked {
+                popup_terminal_id: Some("terminal-popup".into()),
+            }),
+        );
+        assert!(dispatch(&mut gate, &mut shell, &mut registry, now).is_none());
+
+        popup_over_second_pane(&mut shell, None);
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+        assert!(
+            gate.pending_plan.as_ref().unwrap().start_episode,
+            "own popup projection continues the consumed launch episode"
+        );
+        assert!(
+            gate.desired.is_none(),
+            "unreported popup must release parent mode"
+        );
+        applied(&mut gate);
+        gate.enqueue(
+            &mut shell,
+            &registry,
+            Vec::new(),
+            vec![RawInputEvent::OuterFocusLost],
+            None,
+            false,
+            now,
+        )
+        .unwrap();
+        assert!(!gate.episode);
+        assert!(!gate.pending_plan.as_ref().unwrap().start_episode);
+        gate.enqueue(
+            &mut shell,
+            &registry,
+            Vec::new(),
+            vec![RawInputEvent::OuterFocusGained],
+            None,
+            false,
+            now,
+        )
+        .unwrap();
+        assert!(
+            gate.pending_plan.as_ref().unwrap().start_episode,
+            "real focus gain samples the still-live own popup, not its parent"
+        );
+        assert!(gate.desired.is_none());
+        applied(&mut gate);
+        let popup_authorization = gate.authorization.as_ref().unwrap().clone();
+        let mut returned = shell.pane_surface.as_ref().unwrap().clone();
+        gate.complete(Completion {
+            authorization: popup_authorization.clone(),
+            result: Ok(AckScope::Inactive),
+        })
+        .unwrap();
+        assert!(!gate.episode);
+        enqueue(&mut gate, &mut shell, &registry, b"x", now);
+        assert!(
+            gate.pending_plan.as_ref().unwrap().start_episode,
+            "fresh popup input, not its receipt, may resume an inactive episode"
+        );
+        applied(&mut gate);
+        dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+        returned.popup = None;
+        shell.set_pane_surface(returned);
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+        assert!(
+            gate.pending_plan.as_ref().unwrap().start_episode,
+            "own popup return must sample the exact parent mode afresh"
+        );
+        assert_eq!(
+            gate.desired
+                .as_ref()
+                .unwrap()
+                .identity
+                .reporter_session
+                .as_deref(),
+            Some("reporter-a")
+        );
+        gate.complete(Completion {
+            authorization: popup_authorization,
+            result: Ok(AckScope::Applied),
+        })
+        .unwrap();
+        assert!(!gate.applied, "popup ACK cannot authorize returned parent");
+    }
+
+    #[test]
+    fn foreign_or_failed_popup_cannot_continue_the_local_launch_episode() {
+        for terminal_id in [None, Some("foreign-popup")] {
+            let (mut gate, mut shell, mut registry, _) = fixture(Some(InputIntentState::Command));
+            let now = Instant::now();
+            let request_id = launch_test_popup(&mut gate, &mut shell, &mut registry, now);
+            let old_authorization = gate.authorization.as_ref().unwrap().clone();
+            let boot_id = gate.binding.as_ref().unwrap().route.boot_id.to_string();
+            shell.handle_endpoint_result(
+                &boot_id,
+                &request_id,
+                Ok(crate::api::schema::ResponseResult::CommandInvoked {
+                    popup_terminal_id: terminal_id.map(str::to_owned),
+                }),
+            );
+            popup_over_second_pane(&mut shell, Some(InputIntentState::Command));
+            gate.synchronize(&mut shell, &registry, false, now).unwrap();
+            assert!(!gate.episode);
+            assert!(!gate.pending_plan.as_ref().unwrap().start_episode);
+            gate.complete(Completion {
+                authorization: old_authorization,
+                result: Ok(AckScope::Applied),
+            })
+            .unwrap();
+            assert!(!gate.applied);
+            let mut returned = shell.pane_surface.as_ref().unwrap().clone();
+            returned.popup = None;
+            shell.set_pane_surface(returned);
+            gate.synchronize(&mut shell, &registry, false, now).unwrap();
+            assert!(
+                !gate.pending_plan.as_ref().unwrap().start_episode,
+                "foreign popup closure must not reactivate the parent reporter"
+            );
+        }
+    }
+
+    #[test]
+    fn own_popup_background_closure_cannot_resume_an_inactive_parent() {
+        for lost_focus in [false, true] {
+            let (mut gate, mut shell, mut registry, _) = fixture(Some(InputIntentState::Command));
+            let now = Instant::now();
+            let request_id = launch_test_popup(&mut gate, &mut shell, &mut registry, now);
+            let boot_id = gate.binding.as_ref().unwrap().route.boot_id.to_string();
+            shell.handle_endpoint_result(
+                &boot_id,
+                &request_id,
+                Ok(crate::api::schema::ResponseResult::CommandInvoked {
+                    popup_terminal_id: Some("terminal-popup".into()),
+                }),
+            );
+            popup_over_second_pane(&mut shell, Some(InputIntentState::Command));
+            gate.synchronize(&mut shell, &registry, false, now).unwrap();
+            applied(&mut gate);
+            let popup_authorization = gate.authorization.as_ref().unwrap().clone();
+            if lost_focus {
+                gate.enqueue(
+                    &mut shell,
+                    &registry,
+                    Vec::new(),
+                    vec![RawInputEvent::OuterFocusLost],
+                    None,
+                    false,
+                    now,
+                )
+                .unwrap();
+            } else {
+                gate.complete(Completion {
+                    authorization: popup_authorization.clone(),
+                    result: Ok(AckScope::Inactive),
+                })
+                .unwrap();
+            }
+            let mut returned = shell.pane_surface.as_ref().unwrap().clone();
+            returned.popup = None;
+            shell.set_pane_surface(returned);
+            gate.synchronize(&mut shell, &registry, false, now).unwrap();
+            assert!(!gate.episode);
+            assert!(
+                !gate.pending_plan.as_ref().unwrap().start_episode,
+                "an exact receipt is UI identity, never background source permission"
+            );
+            gate.complete(Completion {
+                authorization: popup_authorization,
+                result: Ok(AckScope::Applied),
+            })
+            .unwrap();
+            assert!(!gate.applied);
+        }
+    }
+
     #[test]
     fn unrelated_balancing_release_does_not_drop_a_deferred_prefix_command() {
         let (mut gate, mut shell, mut registry, _messages) = fixture(Some(InputIntentState::Text));
@@ -3024,6 +3416,80 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_and_delayed_reporters_require_a_new_real_focus_episode() {
+        for new_boot in [false, true] {
+            let (mut gate, mut shell, mut registry, _) = fixture(Some(InputIntentState::Command));
+            let now = Instant::now();
+            enqueue(&mut gate, &mut shell, &registry, b"x", now);
+            applied(&mut gate);
+            dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+            let focus_epoch = gate.focus_epoch;
+            let mut snapshot = shell.snapshot.as_ref().unwrap().as_ref().clone();
+
+            registry.disconnect(&ClientEndpointId::Local);
+            shell.mark_endpoint_disconnected(&ClientEndpointId::Local);
+            gate.synchronize(&mut shell, &registry, false, now).unwrap();
+            assert!(gate.desired.is_none());
+            assert!(gate.pending_plan.as_ref().unwrap().live_leases.is_empty());
+
+            let (sender, _receiver) = mpsc::channel();
+            registry.insert(
+                ClientEndpointId::Local,
+                RecordingTransport(sender),
+                2,
+                negotiation(),
+                false,
+            );
+            snapshot.revision += 1;
+            if new_boot {
+                snapshot.boot_id = "boot-2".into();
+            }
+            shell.set_endpoint_snapshot_for_generation(
+                &ClientEndpointId::Local,
+                2,
+                Box::new(snapshot.clone()),
+            );
+            shell.set_endpoint_status(&ClientEndpointId::Local, ClientEndpointStatus::Online);
+            registry.set_surface_active(&ClientEndpointId::Local, true);
+            gate.synchronize(&mut shell, &registry, false, now).unwrap();
+            assert!(gate.batches.is_empty());
+            assert_eq!(gate.focus_epoch, focus_epoch);
+            assert!(
+                !gate.pending_plan.as_ref().unwrap().start_episode,
+                "reconnected active roster is not a new genuine focus episode"
+            );
+
+            // A later roster cannot remove the reconnect barrier either.
+            snapshot.revision += 1;
+            let mut roster = snapshot.input_intents.as_ref().unwrap().to_vec();
+            roster[0].sessions[0].session = "delayed-reporter".into();
+            snapshot.input_intents = Some(roster.into());
+            shell.cache_endpoint_snapshot_for_generation(
+                &ClientEndpointId::Local,
+                2,
+                Box::new(snapshot),
+            );
+            gate.synchronize(&mut shell, &registry, false, now).unwrap();
+            assert!(!gate.pending_plan.as_ref().unwrap().start_episode);
+            assert!(!gate.applied);
+
+            gate.enqueue(
+                &mut shell,
+                &registry,
+                Vec::new(),
+                vec![RawInputEvent::OuterFocusGained],
+                None,
+                false,
+                now,
+            )
+            .unwrap();
+            assert!(gate.focus_epoch > focus_epoch);
+            assert!(gate.pending_plan.as_ref().unwrap().start_episode);
+            assert!(!gate.applied);
+        }
+    }
+
+    #[test]
     fn disconnected_endpoint_drops_all_local_reporter_connections_from_live_roster() {
         let (mut gate, mut shell, registry, _) = fixture(Some(InputIntentState::Command));
         let now = Instant::now();
@@ -3073,6 +3539,88 @@ mod tests {
 #[cfg(test)]
 mod foreground_sample_tests {
     use super::*;
+
+    #[test]
+    fn newly_activated_foreground_reporter_samples_before_its_first_key() {
+        use crate::api::schema::InputIntentSession;
+        let (mut gate, mut shell, mut registry, _) = super::tests::fixture(None);
+        let now = Instant::now();
+        // The shell's launch key establishes this foreground episode; the
+        // application itself must not need a first key to select its source.
+        super::tests::enqueue(&mut gate, &mut shell, &registry, b"\r", now);
+        super::tests::applied(&mut gate);
+        super::tests::dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+        let release_authorization = gate.authorization.as_ref().unwrap().clone();
+
+        let mut snapshot = shell.snapshot.as_ref().unwrap().as_ref().clone();
+        snapshot.revision += 1;
+        let mut terminal = TerminalInputIntents {
+            terminal_id: "terminal-1".into(),
+            sessions: vec![InputIntentSession {
+                session: "new-foreground-app".into(),
+                generation: 1,
+                policy: InputIntentPolicy::Unknown,
+                state: InputIntentState::Unknown,
+                active: false,
+            }],
+        };
+        snapshot.input_intents = Some(vec![terminal.clone()].into());
+        shell.cache_endpoint_snapshot_for_generation(
+            &ClientEndpointId::Local,
+            1,
+            Box::new(snapshot.clone()),
+        );
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+        assert!(gate.desired.is_none());
+        assert!(!gate.pending_plan.as_ref().unwrap().start_episode);
+
+        snapshot.revision += 1;
+        terminal.sessions[0].generation += 1;
+        terminal.sessions[0].policy = InputIntentPolicy::Mode;
+        terminal.sessions[0].state = InputIntentState::Command;
+        terminal.sessions[0].active = true;
+        snapshot.input_intents = Some(vec![terminal].into());
+        shell.cache_endpoint_snapshot_for_generation(
+            &ClientEndpointId::Local,
+            1,
+            Box::new(snapshot),
+        );
+        gate.synchronize(&mut shell, &registry, false, now).unwrap();
+
+        assert!(
+            gate.batches.is_empty(),
+            "startup must not require a first key"
+        );
+        let plan = gate.pending_plan.as_ref().unwrap();
+        assert_eq!(
+            plan.desired
+                .as_ref()
+                .unwrap()
+                .identity
+                .reporter_session
+                .as_deref(),
+            Some("new-foreground-app")
+        );
+        assert!(
+            plan.start_episode,
+            "new foreground declaration must sample the local source"
+        );
+        assert!(
+            !gate.applied,
+            "recorded intent cannot authorize local input"
+        );
+        gate.complete(Completion {
+            authorization: release_authorization,
+            result: Ok(AckScope::Applied),
+        })
+        .unwrap();
+        assert!(
+            !gate.applied,
+            "old release ACK cannot authorize the new application"
+        );
+        super::tests::applied(&mut gate);
+        assert!(gate.applied);
+    }
 
     #[test]
     fn cached_applied_never_skips_fresh_ack_for_a_new_real_tty_batch() {

@@ -182,6 +182,14 @@ impl ClientShellState {
             }
             crate::input::KeybindMatch::Command(command) => {
                 let action = command.action.into();
+                if action == crate::protocol::ClientShellCommandAction::Popup {
+                    self.popup_command_completion = None;
+                    self.popup_pending = false;
+                    self.popup_pending_deadline = None;
+                    self.pending_requests.retain(|_, pending| {
+                        !matches!(pending.kind, PendingEndpointKind::PopupCommand)
+                    });
+                }
                 let resolved_labels = command.bindings.labels();
                 let command_id = self.snapshot.as_deref().and_then(|snapshot| {
                     if let Some(candidate) = snapshot.commands.iter().find(|candidate| {
@@ -253,8 +261,13 @@ impl ClientShellState {
                 if action == crate::protocol::ClientShellCommandAction::Popup {
                     self.popup_pending = true;
                     self.popup_pending_deadline = None;
+                    let method = if self.ime_control_enabled {
+                        crate::api::schema::Method::CommandInvokeReceipt(params)
+                    } else {
+                        crate::api::schema::Method::CommandInvoke(params)
+                    };
                     if !self.push_endpoint_method_with_kind(
-                        crate::api::schema::Method::CommandInvoke(params),
+                        method,
                         PendingEndpointKind::PopupCommand,
                         outcome,
                     ) {
@@ -609,18 +622,47 @@ impl ClientShellState {
                 };
             }
             PendingEndpointKind::PopupCommand => {
-                return match result {
-                    Ok(_) => {
+                if pending.method_name == "command.invoke" {
+                    if result.is_ok() {
                         self.popup_pending_deadline =
                             Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
-                        (false, Vec::new())
+                        return (false, Vec::new());
                     }
-                    Err(_) => {
-                        self.popup_pending = false;
-                        self.popup_pending_deadline = None;
-                        (true, Vec::new())
+                    self.popup_pending = false;
+                    self.popup_pending_deadline = None;
+                    return (true, Vec::new());
+                }
+                if pending.method_name != "command.invoke_receipt" {
+                    self.set_endpoint_error("endpoint returned an unexpected popup command result");
+                    self.popup_pending = false;
+                    self.popup_pending_deadline = None;
+                    return (true, Vec::new());
+                }
+                let terminal_id = match result {
+                    Ok(crate::api::schema::ResponseResult::CommandInvoked {
+                        popup_terminal_id: Some(terminal_id),
+                    }) if !terminal_id.is_empty() => Some(terminal_id.into()),
+                    Ok(_) => {
+                        self.set_endpoint_error(
+                            "endpoint returned an unexpected popup command result",
+                        );
+                        None
                     }
+                    Err(_) => None,
                 };
+                let succeeded = terminal_id.is_some();
+                self.popup_command_completion = Some(PopupCommandCompletion {
+                    request_id: request_id.to_owned(),
+                    terminal_id,
+                });
+                if succeeded {
+                    self.popup_pending_deadline =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+                    return (false, Vec::new());
+                }
+                self.popup_pending = false;
+                self.popup_pending_deadline = None;
+                return (true, Vec::new());
             }
             PendingEndpointKind::PaneScroll { pane_id, serial } => {
                 let mut outcome = ClientShellInput::default();

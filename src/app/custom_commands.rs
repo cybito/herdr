@@ -10,6 +10,12 @@ use super::{App, Mode};
 
 static NEXT_COMMAND_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy)]
+pub(super) enum CommandInvokeResponse {
+    Ok,
+    Receipt,
+}
+
 pub(super) fn new_command_namespace() -> String {
     let counter = NEXT_COMMAND_NAMESPACE.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -77,10 +83,11 @@ impl App {
             .map(|entry| entry.binding.clone())
     }
 
-    pub(crate) fn handle_command_invoke(
+    pub(super) fn handle_command_invoke(
         &mut self,
         id: String,
         params: crate::api::schema::CommandInvokeParams,
+        response: CommandInvokeResponse,
     ) -> String {
         let Some(binding) = self.resolve_client_shell_command(&params.command_id) else {
             return crate::app::api::responses::encode_error(
@@ -94,7 +101,7 @@ impl App {
         }
         let selected_text = if binding.action == crate::config::CustomCommandAction::PluginAction {
             let Some(selection) = params.selection.as_ref() else {
-                return self.execute_custom_command_response(id, &binding, None);
+                return self.execute_custom_command_response(id, &binding, None, response);
             };
             if params.pane_id.as_deref() != Some(selection.pane_id.as_str()) {
                 return crate::app::api::responses::encode_error(
@@ -112,7 +119,7 @@ impl App {
         } else {
             None
         };
-        self.execute_custom_command_response(id, &binding, selected_text)
+        self.execute_custom_command_response(id, &binding, selected_text, response)
     }
 
     fn execute_custom_command_response(
@@ -120,12 +127,36 @@ impl App {
         id: String,
         binding: &crate::config::CustomCommandKeybind,
         selected_text: Option<String>,
+        response: CommandInvokeResponse,
     ) -> String {
         match self.execute_custom_command_binding(binding, selected_text) {
-            Ok(()) => crate::app::api::responses::encode_success(
-                id,
-                crate::api::schema::ResponseResult::Ok {},
-            ),
+            Ok(()) => {
+                if matches!(response, CommandInvokeResponse::Ok) {
+                    return crate::app::api::responses::encode_success(
+                        id,
+                        crate::api::schema::ResponseResult::Ok {},
+                    );
+                }
+                let popup_terminal_id =
+                    if binding.action == crate::config::CustomCommandAction::Popup {
+                        // Popup creation refuses an existing popup and installs its own ID
+                        // synchronously before returning success.
+                        let Some(popup) = self.state.popup_pane.as_ref() else {
+                            return crate::app::api::responses::encode_error(
+                                id,
+                                "command_failed",
+                                "popup command completed without a popup terminal",
+                            );
+                        };
+                        Some(popup.terminal_id.as_str().to_owned())
+                    } else {
+                        None
+                    };
+                crate::app::api::responses::encode_success(
+                    id,
+                    crate::api::schema::ResponseResult::CommandInvoked { popup_terminal_id },
+                )
+            }
             Err(error) => {
                 crate::app::api::responses::encode_error(id, "command_failed", error.to_string())
             }
@@ -630,6 +661,7 @@ mod tests {
                 pane_id: None,
                 selection: None,
             },
+            super::CommandInvokeResponse::Ok,
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "command_not_found");
@@ -679,6 +711,7 @@ mod tests {
                 pane_id: None,
                 selection: None,
             },
+            super::CommandInvokeResponse::Ok,
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "command_not_found");
@@ -720,6 +753,7 @@ mod tests {
                     content_revision: Some(u64::MAX),
                 }),
             },
+            super::CommandInvokeResponse::Ok,
         );
 
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -740,28 +774,132 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let mut command = binding(crate::config::CustomCommandAction::Shell);
-        command.command = format!("printf invoked > {}", path.display());
+        command.command = format!("printf invoked >> {}", path.display());
         install(&mut app, command);
         let command_id = app.client_shell_command_manifest()[0].command_id.clone();
 
-        let response = app.handle_command_invoke(
-            "request-1".into(),
-            crate::api::schema::CommandInvokeParams {
-                command_id,
+        let params = crate::api::schema::CommandInvokeParams {
+            command_id,
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+            selection: None,
+        };
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "request-legacy".into(),
+            method: crate::api::schema::Method::CommandInvoke(params.clone()),
+        });
+        let success: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, crate::api::schema::ResponseResult::Ok {});
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::fs::read_to_string(&path).ok().as_deref() != Some("invoked")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "invoked");
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "request-receipt".into(),
+            method: crate::api::schema::Method::CommandInvokeReceipt(params),
+        });
+        let success: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            success.result,
+            crate::api::schema::ResponseResult::CommandInvoked {
+                popup_terminal_id: None,
+            }
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::fs::read_to_string(&path).unwrap() != "invokedinvoked"
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "invokedinvoked");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn popup_command_receipt_identifies_created_terminal_and_rejects_collision() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("popup-command")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let root_terminal_id = app.state.workspaces[0]
+            .terminal_id(app.state.workspaces[0].tabs[0].root_pane)
+            .unwrap()
+            .clone();
+        let mut command = binding(crate::config::CustomCommandAction::Popup);
+        command.command = "echo popup".into();
+        install(&mut app, command);
+        let command_id = app.client_shell_command_manifest()[0].command_id.clone();
+        let invoke = |app: &mut crate::app::App, request_id: &str, receipt: bool| {
+            let params = crate::api::schema::CommandInvokeParams {
+                command_id: command_id.clone(),
                 workspace_id: None,
                 tab_id: None,
                 pane_id: None,
                 selection: None,
-            },
-        );
+            };
+            app.handle_api_request(crate::api::schema::Request {
+                id: request_id.into(),
+                method: if receipt {
+                    crate::api::schema::Method::CommandInvokeReceipt(params)
+                } else {
+                    crate::api::schema::Method::CommandInvoke(params)
+                },
+            })
+        };
+
+        let response = invoke(&mut app, "legacy-popup", false);
         let success: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "legacy-popup");
         assert_eq!(success.result, crate::api::schema::ResponseResult::Ok {});
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !path.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "invoked");
-        let _ = std::fs::remove_file(path);
+        assert_ne!(
+            app.state.popup_pane.as_ref().unwrap().terminal_id,
+            root_terminal_id
+        );
+        assert!(app.close_popup_pane());
+
+        let response = invoke(&mut app, "foreign-popup", true);
+        let success: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        let created_terminal_id = app.state.popup_pane.as_ref().unwrap().terminal_id.clone();
+        assert_eq!(success.id, "foreign-popup");
+        assert_eq!(
+            success.result,
+            crate::api::schema::ResponseResult::CommandInvoked {
+                popup_terminal_id: Some(created_terminal_id.as_str().to_owned()),
+            }
+        );
+        assert_ne!(created_terminal_id, root_terminal_id);
+
+        let response = invoke(&mut app, "own-popup-after-foreign", true);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.id, "own-popup-after-foreign");
+        assert_eq!(error.error.code, "command_failed");
+        let error_json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(error_json.get("result").is_none());
+        assert_eq!(
+            app.state.popup_pane.as_ref().unwrap().terminal_id,
+            created_terminal_id
+        );
+        assert!(app.close_popup_pane());
+
+        let response = invoke(&mut app, "own-popup-after-close", true);
+        let success: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        let replacement_terminal_id = app.state.popup_pane.as_ref().unwrap().terminal_id.clone();
+        assert_eq!(success.id, "own-popup-after-close");
+        assert_eq!(
+            success.result,
+            crate::api::schema::ResponseResult::CommandInvoked {
+                popup_terminal_id: Some(replacement_terminal_id.as_str().to_owned()),
+            }
+        );
+        assert_ne!(replacement_terminal_id, created_terminal_id);
+        assert!(app.close_popup_pane());
     }
 
     #[test]

@@ -598,6 +598,10 @@ server 的 `scope:recorded` ACK 只表示意图已保存。聚焦 client 将该�
 
 连接未就绪或投影尚不连贯时，新语义输入以 `IME_INPUT_CANCELLED` 明确取消，不跨连接缓存／重放；已发送 key release 仍独立处理。快照 revision 仅在 connection generation 内排序：同一 boot 的重连允许低 revision，旧投影在 surface 完成交接后才由新连接快照替换。焦点仍取已提交画面，必须匹配当前 connection generation 与 boot；同连接的完整 reporter roster 可以比画面更新，但不能比画面更旧，不因 metadata-only 更新等待不存在的新画面。当前连接缺失完整 roster 仍为 `IME_INTENT_PROTOCOL_ERROR`，不视为兼容空值。
 
+启用本机 IME 的 Popup 命令使用单独协商的 `command.invoke_receipt`，成功返回 `command_invoked` 与精确的 `popup_terminal_id`；不支持该方法的 endpoint 在发送前明确拒绝，不回退到无身份回执。原 `command.invoke` 的 `ok` 响应及未启用 IME 的命令行为保持不变。
+
+本地 Popup 的当前请求、成功回执、实际 terminal 和父 route 必须相符，才能延续当前真实输入 episode；不能把最先出现的 Popup 投影当成本地请求的结果。这个身份记录不是切源权限：失焦或 inactive ACK 撤销当前权限，metadata、失败／取消回执与外来 Popup 都不能重新建立 episode。同一存活 Popup 经真实 key/FocusIn 建立新 episode 后，返回仍 active 的精确父 terminal 也须重新采样并等待新 ACK；旧 Popup ACK 不授权父 terminal。
+
 client FIFO 门禁限 256 batches、2MiB、5s；失败明确拒绝，已发送按键的 release 仍走原 route，不等待新 ACK。网络收到意图前或外层 IME 已消费的首字符无法由此保护。Linux client 还要求独立、可信的 Hyprland foreground observer，不能用 daemon 存活或 reporter 的 FocusLost 代替真实图形焦点。
 
 Unix 会话目录以 `0700` 创建；已有的当前用户所有、无外部写入权限且可读写的目录会安全收窄为 `0700`，保留目录身份和会话数据。路径须为绝对规范路径，拒绝用户可替换的目录符号链接；仅允许只读 root 所有父目录中的 root 所有系统祖先别名，并逐组件验证解析目标。外部可写、非当前用户所有或只读的会话目录会被拒绝，不自动接管；这不放宽本机 IME guard 的 socket 信任规则。

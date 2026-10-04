@@ -568,6 +568,7 @@ fn popup_command_blocks_underlying_input_until_surface_or_error() {
             description: None,
         });
     state.set_snapshot(Box::new(projection));
+    state.set_endpoint_methods(Some(vec!["command.invoke".into()]));
     state.set_pane_surface(surface());
 
     let mut invoke = ClientShellInput::default();
@@ -622,6 +623,7 @@ fn popup_command_blocks_underlying_input_until_surface_or_error() {
         Ok(crate::api::schema::ResponseResult::Ok {}),
     );
     assert!(state.popup_pending);
+    assert!(state.popup_command_completion.is_none());
     assert!(state
         .handle_input_bytes(b"still-blocked")
         .requests

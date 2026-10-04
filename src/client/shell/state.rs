@@ -697,6 +697,13 @@ pub(super) struct PendingEndpointRequest {
     pub(super) kind: PendingEndpointKind,
 }
 
+/// A local command receipt, not proof of popup presentation or IME ownership.
+#[derive(Debug)]
+pub(super) struct PopupCommandCompletion {
+    pub(super) request_id: String,
+    pub(super) terminal_id: Option<std::sync::Arc<str>>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum ClientEndpointNoticeKind {
     Unsupported,
@@ -957,6 +964,7 @@ pub(crate) struct ClientShellState {
     pub(super) ime_input_deadline: Option<std::time::Instant>,
     pub(super) popup_pending: bool,
     pub(super) popup_pending_deadline: Option<std::time::Instant>,
+    pub(super) popup_command_completion: Option<PopupCommandCompletion>,
     pub(super) next_request_id: u64,
     pub(super) pending_requests: HashMap<String, PendingEndpointRequest>,
     pub(super) pending_integration_installs: usize,
@@ -1127,6 +1135,7 @@ impl ClientShellState {
             ime_input_deadline: None,
             popup_pending: false,
             popup_pending_deadline: None,
+            popup_command_completion: None,
             next_request_id: 1,
             pending_requests: HashMap::new(),
             pending_integration_installs: 0,
@@ -1284,6 +1293,7 @@ impl ClientShellState {
         self.pane_scroll_targets.clear();
         self.popup_pending = false;
         self.popup_pending_deadline = None;
+        self.popup_command_completion = None;
         self.pending_integration_installs = 0;
         self.endpoint_notice_seen.clear();
         self.visible_endpoint_notice = None;

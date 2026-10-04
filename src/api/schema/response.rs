@@ -277,6 +277,10 @@ pub enum ResponseResult {
         active: bool,
         projection_revision: u64,
     },
+    CommandInvoked {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        popup_terminal_id: Option<String>,
+    },
     Ok {},
     PaneInputIntentStreamOpened {
         session: String,

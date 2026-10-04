@@ -228,6 +228,7 @@ impl HeadlessServer {
         matches!(
             method,
             Method::CommandInvoke(_)
+                | Method::CommandInvokeReceipt(_)
                 | Method::PaneClose(_)
                 | Method::PaneEditScrollback(_)
                 | Method::PaneMove(_)
@@ -249,6 +250,7 @@ impl HeadlessServer {
             method,
             Method::AgentFocus(_)
                 | Method::CommandInvoke(_)
+                | Method::CommandInvokeReceipt(_)
                 | Method::LayoutSetSplitRatio(_)
                 | Method::PaneClose(_)
                 | Method::PaneCopyMotion(_)
@@ -290,6 +292,7 @@ impl HeadlessServer {
             method,
             Method::AgentFocus(_)
                 | Method::CommandInvoke(_)
+                | Method::CommandInvokeReceipt(_)
                 | Method::LayoutSetSplitRatio(_)
                 | Method::PaneClose(_)
                 | Method::PaneEditScrollback(_)
@@ -358,7 +361,8 @@ impl HeadlessServer {
                     self.app.public_tab_id(workspace_index, tab_index)
                 })
                 .is_some_and(|tab_id| self.focus_shell_client_on_tab(client_id, &tab_id)),
-            api::schema::Method::CommandInvoke(params) => params
+            api::schema::Method::CommandInvoke(params)
+            | api::schema::Method::CommandInvokeReceipt(params) => params
                 .tab_id
                 .as_deref()
                 .is_some_and(|tab_id| self.focus_shell_client_on_tab(client_id, tab_id)),

@@ -1017,7 +1017,18 @@ impl App {
                 return responses::encode_success(request.id, ResponseResult::Ok {});
             }
             Method::CommandInvoke(params) => {
-                return self.handle_command_invoke(request.id, params);
+                return self.handle_command_invoke(
+                    request.id,
+                    params,
+                    super::custom_commands::CommandInvokeResponse::Ok,
+                );
+            }
+            Method::CommandInvokeReceipt(params) => {
+                return self.handle_command_invoke(
+                    request.id,
+                    params,
+                    super::custom_commands::CommandInvokeResponse::Receipt,
+                );
             }
             Method::ClientWindowTitleSet(_) | Method::ClientWindowTitleClear(_) => {
                 return responses::encode_success(

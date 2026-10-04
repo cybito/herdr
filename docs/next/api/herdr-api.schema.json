@@ -4888,6 +4888,22 @@
         {
           "properties": {
             "method": {
+              "const": "command.invoke_receipt",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CommandInvokeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "client.window_title.set",
               "type": "string"
             },
@@ -10445,6 +10461,24 @@
                 "type",
                 "active",
                 "projection_revision"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "popup_terminal_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "command_invoked",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
               ],
               "type": "object"
             },

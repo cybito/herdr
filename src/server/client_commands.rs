@@ -15,6 +15,7 @@ const ENDPOINT_RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
 const CLIENT_SHELL_METHODS: &[&str] = &[
     "client_shell.surface.set",
     "command.invoke",
+    "command.invoke_receipt",
     "integration.install",
     "integration.list",
     "layout.set_split_ratio",
@@ -296,6 +297,10 @@ mod tests {
         assert_eq!(
             actual.remove("pane.link.resolve").as_deref(),
             Some("f5e4a3e01453ae7b188f127ce951c12c20e0bebcc17cc364eeb6d1a01fd5bf81")
+        );
+        assert_eq!(
+            actual.remove("command.invoke_receipt").as_deref(),
+            Some("cb1b10ed38b8a57b47cb1df79899d29fcd4eac6ed4485468fc47af36eaa0ddf9")
         );
 
         assert_eq!(

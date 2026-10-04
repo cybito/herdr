@@ -28,6 +28,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::ProductAnnouncementDismiss(_)
             | Method::ReleaseNotesDismiss(_)
             | Method::CommandInvoke(_)
+            | Method::CommandInvokeReceipt(_)
             | Method::WorkspaceCreate(_)
             | Method::WorkspaceFocus(_)
             | Method::WorkspaceRename(_)
