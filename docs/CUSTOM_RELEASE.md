@@ -8,7 +8,7 @@
 
 Only a published GitHub Release in `cybito/herdr` triggers `.github/workflows/custom-release.yml`. Ordinary pushes, tag pushes, and pull requests do not publish. Keep the fork's default branch `custom`; disable inherited upstream workflows, leaving only Custom release enabled.
 
-Tags are `v<major>.<minor>.<patch>-custom.<positive integer>`, and their dereferenced commit must be an ancestor of `origin/custom`. The base must equal `Cargo.toml`'s package version. This migration's first asset-bearing release uses `v0.9.3-custom.3`; existing tags/releases are never moved. Include the workflow and both scripts in the tagged commit. Validation resolves the tag's exact SHA; both builds checkout that SHA even if `custom` advances.
+Tags are `v<major>.<minor>.<patch>-custom.<positive integer>`, and their dereferenced commit must be an ancestor of `origin/custom`. The base must equal `Cargo.toml`'s package version. This migration's first fully verified asset release uses `v0.9.3-custom.4`; existing tags/releases are never moved. Include the workflow and both scripts in the tagged commit. Validation resolves the tag's exact SHA; both builds checkout that SHA even if `custom` advances.
 
 Publish the GitHub Release at that exact pushed custom SHA. The macOS ARM64 job uses `macos-26`; Omarchy ARM64 GNU/Linux uses `ubuntu-24.04-arm`. Both use Rust **1.96.1**, Zig **0.16.0**, checksum-verified downloads, `cargo build --release --locked`, and the existing Herdr build identity. Native `herdr --version` must print `herdr <tag without v>`.
 
@@ -23,7 +23,7 @@ After both platform sets independently verify, the summary job updates only the 
 Use the assets linked from the GitHub Release for the chosen ARM64 platform. Every file is prefixed `<tag>-<platform>-`; restore the original filename before extracting or validating checksums. For example:
 
 ```sh
-tag=v0.9.3-custom.3
+tag=v0.9.3-custom.4
 platform=linux
 mkdir -p /absolute/empty/download-dir
 cd /absolute/empty/download-dir

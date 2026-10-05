@@ -130,7 +130,7 @@ def check_release(tag,commit,platform,output):
     if existing!=required: return {"exists":False}
     download_assets(tag,sorted(required),output)
     for name in required:
-        local=output/name; require(local.is_file() and not local.is_symlink(),"downloaded asset missing or not a file"); require(sha(local)==assets[name]["digest"],"GitHub asset digest differs after download"); shutil.move(local,output/name[len(f"{tag}-{platform}-"):])
+        local=output/name; require(local.is_file() and not local.is_symlink(),"downloaded asset missing or not a file"); require(f"sha256:{sha(local)}"==assets[name].get("digest"),"GitHub asset digest differs after download"); shutil.move(local,output/name[len(f"{tag}-{platform}-"):])
     checked=verify_asset_set(output,tag,commit,platform); return {"exists":True,"reference":f"https://github.com/cybito/herdr/releases/tag/{tag}","assets":sorted(required),"receipt":checked}
 
 
@@ -214,13 +214,13 @@ class ReleaseBoundaryTests(unittest.TestCase):
     def test_publish_fills_partial_set_without_clobber_and_verifies_download(self):
         tag,commit,platform="v0.9.3-custom.1","a"*40,"linux"
         with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp); package=self.package_fixture(root); required=expected_names(tag,platform); present=next(iter(required)); state={present:{"name":present,"digest":sha(package/present[len(f"{tag}-{platform}-"):])}}; uploads=[]; reads=[]
+            root=Path(tmp); package=self.package_fixture(root); required=expected_names(tag,platform); present=next(iter(required)); state={present:{"name":present,"digest":"sha256:"+sha(package/present[len(f"{tag}-{platform}-"):])}}; uploads=[]; reads=[]
             def fake_gh(args):
                 if args[:2]==["release","view"]: return json.dumps({"assets":list(state.values())}).encode()
                 if args[:2]==["release","upload"]:
                     uploads.append(args); self.assertEqual(args[:4],["release","upload",tag,"--repo"]); self.assertEqual(args[4],"cybito/herdr")
                     for path in args[5:]:
-                        asset=Path(path); state[asset.name]={"name":asset.name,"digest":sha(asset)}
+                        asset=Path(path); state[asset.name]={"name":asset.name,"digest":"sha256:"+sha(asset)}
                     return b""
                 if args[:2]==["release","download"]:
                     reads.append(args); out=Path(args[args.index("--dir")+1]); patterns=[args[i+1] for i,a in enumerate(args) if a=="--pattern"]
@@ -233,7 +233,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
     def test_publish_refuses_existing_mismatched_asset_without_upload(self):
         tag,commit,platform="v0.9.3-custom.1","a"*40,"linux"
         with tempfile.TemporaryDirectory() as tmp:
-            package=self.package_fixture(Path(tmp)); names=expected_names(tag,platform); existing={n:{"name":n,"digest":"0"*64} for n in names}; uploads=[]
+            package=self.package_fixture(Path(tmp)); names=expected_names(tag,platform); existing={n:{"name":n,"digest":"sha256:"+"0"*64} for n in names}; uploads=[]
             def fake_gh(args):
                 if args[:2]==["release","view"]: return json.dumps({"assets":list(existing.values())}).encode()
                 if args[:2]==["release","download"]:
