@@ -20,7 +20,9 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Validate published release identity and custom ancestry
+      - name: Run GitHub Release asset seam tests
+        run: python3 .github/scripts/package-release.py self-test
+      - name: Validate release identity and custom ancestry
         id: release
         env:
           EXPECTED_REPOSITORY: ${{ github.repository }}
@@ -31,16 +33,15 @@ jobs:
           python3 - <<'PY'
           import json, os, runpy
           helper = runpy.run_path('.github/scripts/package-release.py')
-          with open(os.environ['GITHUB_EVENT_PATH']) as f:
-              event = json.load(f)
+          with open(os.environ['GITHUB_EVENT_PATH']) as f: event = json.load(f)
           result = helper['validate_event'](event, os.environ['EXPECTED_REPOSITORY'])
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              for key, value in result.items():
-                  f.write(f'{key}={value}\n')
+              for key, value in result.items(): f.write(f'{key}={value}\\n')
           PY
-
   build:
     needs: validate
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -53,7 +54,6 @@ jobs:
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
-    environment: forgejo-registry
     concurrency:
       group: herdr-${{ needs.validate.outputs.tag }}-${{ matrix.platform }}-arm64
       cancel-in-progress: false
@@ -67,55 +67,22 @@ jobs:
           ref: ${{ needs.validate.outputs.commit }}
           fetch-depth: 0
           persist-credentials: false
-      - &install-oras
-        name: Install checksum-pinned ORAS 1.3.3
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import hashlib, os, pathlib, tarfile, urllib.request
-          platform = 'darwin' if os.environ['RUNNER_OS'] == 'macOS' else 'linux'
-          expected = {
-              'darwin': 'f33fc12753c54172b0d0d19eaa0318d3f90fe9b094d96e8b259c881713c92e1c',
-              'linux': 'ac7156f93a21e903f7ad606c792f3560f17e0cd0e36365634701b1e7cc4e4eca',
-          }[platform]
-          name = f'oras_1.3.3_{platform}_arm64.tar.gz'
-          url = 'https://github.com/oras-project/oras/releases/download/v1.3.3/'
-          checks = urllib.request.urlopen(url + 'oras_1.3.3_checksums.txt').read().decode()
-          official = dict((line.split()[1], line.split()[0]) for line in checks.splitlines() if line.strip())
-          assert official[name] == expected, 'official checksum differs from pinned checksum'
-          archive = pathlib.Path(os.environ['RUNNER_TEMP']) / name
-          archive.write_bytes(urllib.request.urlopen(url + name).read())
-          assert hashlib.sha256(archive.read_bytes()).hexdigest() == expected, 'ORAS download checksum mismatch'
-          destination = pathlib.Path(os.environ['RUNNER_TEMP']) / 'custom-tools'
-          destination.mkdir(exist_ok=True)
-          with tarfile.open(archive) as tar:
-              member = tar.getmember('oras')
-              assert member.isfile()
-              with tar.extractfile(member) as src, (destination / 'oras').open('wb') as dst:
-                  dst.write(src.read())
-          (destination / 'oras').chmod(0o755)
-          with open(os.environ['GITHUB_PATH'], 'a') as f:
-              f.write(str(destination) + '\n')
-          PY
-      - name: Reuse only a fully verified immutable release
+      - name: Check existing GitHub Release asset set
         id: existing
-        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           python3 .github/scripts/package-release.py check --tag "$RELEASE_TAG" --commit "$SOURCE_SHA" --platform "$PLATFORM" --output-dir "$RUNNER_TEMP/existing-package" > "$RUNNER_TEMP/existing.json"
           python3 - <<'PY'
           import json, os
           result = json.load(open(os.environ['RUNNER_TEMP'] + '/existing.json'))
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write('exists=' + str(result['exists']).lower() + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f: f.write('exists=' + str(result['exists']).lower() + '\n')
           if result['exists']:
-              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-                  f.write('Reused verified immutable package: `' + result['reference'] + '`\n')
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f: f.write('Reused verified GitHub Release assets: ' + result['reference'] + '\n')
           PY
       - name: Install native build dependencies
         if: steps.existing.outputs.exists != 'true'
-        shell: bash
         run: |
           set -euo pipefail
           if [[ "$PLATFORM" == linux ]]; then
@@ -126,85 +93,43 @@ jobs:
             command -v ninja
           fi
       - name: Install exact Rust and checksum-pinned Zig
+        if: steps.existing.outputs.exists != 'true'
         env:
           CARGO_HOME: ${{ runner.temp }}/cargo-home
           RUSTUP_HOME: ${{ runner.temp }}/rustup-home
-        if: steps.existing.outputs.exists != 'true'
-        shell: bash
         run: |
           set -euo pipefail
-          # The hosted image supplies rustup; rustup verifies official distribution checksums.
           rustup toolchain install 1.96.1 --profile minimal
           rustup target add --toolchain 1.96.1 "${{ matrix.target }}"
           python3 - <<'PY'
           import hashlib, json, os, pathlib, tarfile, urllib.request
           platform = 'macos' if os.environ['PLATFORM'] == 'darwin' else 'linux'
-          expected = {
-              'macos': 'b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489',
-              'linux': 'ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17',
-          }[platform]
+          expected = {'macos': 'b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489', 'linux': 'ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17'}[platform]
           official = json.load(urllib.request.urlopen('https://ziglang.org/download/index.json'))['0.16.0'][f'aarch64-{platform}']
-          assert official['shasum'] == expected, 'Zig official checksum differs from pinned checksum'
-          expected_url = f'https://ziglang.org/download/0.16.0/zig-aarch64-{platform}-0.16.0.tar.xz'
-          assert official['tarball'] == expected_url
-          root = pathlib.Path(os.environ['RUNNER_TEMP'])
-          archive = root / 'zig-0.16.0.tar.xz'
-          archive.write_bytes(urllib.request.urlopen(expected_url).read())
-          assert hashlib.sha256(archive.read_bytes()).hexdigest() == expected, 'Zig checksum mismatch'
-          with tarfile.open(archive) as tar:
-              # Official checksum-pinned archive; filter rejects path traversal/link escapes.
-              tar.extractall(root, filter='data')
-          with open(os.environ['GITHUB_PATH'], 'a') as f:
-              f.write(str(root / f'zig-aarch64-{platform}-0.16.0') + '\n')
+          assert official['shasum'] == expected
+          archive = pathlib.Path(os.environ['RUNNER_TEMP']) / 'zig.tar.xz'
+          archive.write_bytes(urllib.request.urlopen(official['tarball']).read())
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == expected
+          with tarfile.open(archive) as tar: tar.extractall(os.environ['RUNNER_TEMP'], filter='data')
+          with open(os.environ['GITHUB_PATH'], 'a') as f: f.write(os.environ['RUNNER_TEMP'] + f'/zig-aarch64-{platform}-0.16.0\n')
           PY
-      - name: Build exact source and smoke without starting a server
+      - name: Build and native smoke
+        if: steps.existing.outputs.exists != 'true'
         env:
           CARGO_HOME: ${{ runner.temp }}/cargo-home
           RUSTUP_HOME: ${{ runner.temp }}/rustup-home
-        if: steps.existing.outputs.exists != 'true'
-        shell: bash
         run: bash .github/scripts/custom-release.sh build "$PLATFORM" "$RELEASE_TAG" "$SOURCE_SHA" "$RUNNER_TEMP/herdr-build"
-      - name: Package and exercise isolated explicit-prefix installation
+      - name: Package and exercise isolated install smoke
         if: steps.existing.outputs.exists != 'true'
-        shell: bash
         run: |
           set -euo pipefail
           python3 .github/scripts/package-release.py pack --tag "$RELEASE_TAG" --commit "$SOURCE_SHA" --platform "$PLATFORM" --input-dir "$RUNNER_TEMP/herdr-build" --output-dir "$RUNNER_TEMP/herdr-package"
           bash .github/scripts/custom-release.sh smoke "$PLATFORM" "$RELEASE_TAG" "$SOURCE_SHA" "$RUNNER_TEMP/herdr-package"
-      - name: Publish and verify manifest, layers, and independent digest pull
+      - name: Upload without overwrite and verify downloaded assets
         if: steps.existing.outputs.exists != 'true'
         env:
-          FORGEJO_REGISTRY_TOKEN: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          set +x
-          umask 077
-          auth_dir="$RUNNER_TEMP/herdr-registry-auth"
-          mkdir -m 700 "$auth_dir"
-          auth="$auth_dir/registry-auth.json"
-          trap 'rm -f "$auth"; rmdir "$auth_dir"; unset FORGEJO_REGISTRY_TOKEN' EXIT
-          [[ -n "$FORGEJO_REGISTRY_TOKEN" ]] || { echo 'FORGEJO_REGISTRY_TOKEN is required' >&2; exit 1; }
-          printf '%s' "$FORGEJO_REGISTRY_TOKEN" | oras login git.cybit.top --username cybit --password-stdin --registry-config "$auth"
-          chmod 600 "$auth"
-          unset FORGEJO_REGISTRY_TOKEN
-          python3 .github/scripts/package-release.py publish --directory "$RUNNER_TEMP/herdr-package" --registry-config "$auth" > "$RUNNER_TEMP/published.json"
-          python3 - <<'PY'
-          import json, os, subprocess
-          result = json.load(open(os.environ['RUNNER_TEMP'] + '/published.json'))
-          subprocess.run(['python3', '.github/scripts/package-release.py', 'verify', '--reference', result['reference'], '--output-dir', os.environ['RUNNER_TEMP'] + '/anonymous-verified'], check=True)
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-              f.write('Published and anonymously verified: `' + result['reference'] + '`\n')
-          PY
-      - name: Always remove registry authentication
-        if: always()
-        shell: bash
-        run: |
-          set +x
-          rm -f "$RUNNER_TEMP/herdr-registry-auth/registry-auth.json"
-          if [[ -d "$RUNNER_TEMP/herdr-registry-auth" ]]; then rmdir "$RUNNER_TEMP/herdr-registry-auth"; fi
-          unset FORGEJO_REGISTRY_TOKEN
-
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/package-release.py publish --directory "$RUNNER_TEMP/herdr-package"
   summarize:
     needs: [validate, build]
     runs-on: ubuntu-24.04-arm
@@ -223,47 +148,33 @@ jobs:
           ref: ${{ needs.validate.outputs.commit }}
           fetch-depth: 0
           persist-credentials: false
-      - *install-oras
-      - name: Verify both platform packages anonymously and update notes only
+      - name: Verify both platforms and update managed release notes
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, pathlib, re, subprocess, urllib.request
+          import json, os, re, subprocess, urllib.request
           tag, source = os.environ['RELEASE_TAG'], os.environ['SOURCE_SHA']
           rows = []
           for platform in ('darwin', 'linux'):
               result = json.loads(subprocess.check_output(['python3', '.github/scripts/package-release.py', 'check', '--tag', tag, '--commit', source, '--platform', platform, '--output-dir', os.environ['RUNNER_TEMP'] + '/summary-' + platform], text=True))
-              assert result['exists'], 'both platforms must exist before writing success notes'
-              receipt = json.loads(pathlib.Path(os.environ['RUNNER_TEMP'], 'summary-' + platform, 'release.json').read_text())
-              assert receipt['source_commit'] == source
-              rows.append((platform, result['reference']))
-          release_id = os.environ['RELEASE_ID']
-          assert re.fullmatch(r'[0-9]+', release_id)
+              assert result['exists'], 'both platform asset sets are required'
+              links = ''.join(f'- [{name}](https://github.com/cybito/herdr/releases/download/{tag}/{name})\n' for name in result['assets'])
+              rows.append((platform, links))
+          release_id = os.environ['RELEASE_ID']; assert re.fullmatch(r'[0-9]+', release_id)
           url = 'https://api.github.com/repos/cybito/herdr/releases/' + release_id
           headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
-          release = json.load(urllib.request.urlopen(urllib.request.Request(url, headers=headers)))
-          assert release['tag_name'] == tag and not release['assets'], 'release changed or assets are not empty'
-          start, end = '<!-- custom-builds:start -->', '<!-- custom-builds:end -->'
-          body = release.get('body') or ''
-          assert body.count(start) == body.count(end) and body.count(start) <= 1, 'ambiguous custom-build notes block'
-          block = start + '\n## Custom ARM64 builds\n\nSource: `https://github.com/cybito/herdr.git` at `' + source + '`; release `' + tag + '`.\n\n[Forgejo package versions](https://git.cybit.top/cybit/-/packages/container/ias-herdr/versions)\n\n| Platform | Immutable OCI reference |\n|---|---|\n'
-          for platform, reference in rows:
-              block += '| ' + platform + '-arm64 | `' + reference + '` |\n'
-          for platform, reference in rows:
-              block += '\n' + platform + ':\n```sh\noras pull ' + reference + '\n```\n'
-          block += '\nSee [installation instructions](https://github.com/cybito/herdr/blob/' + source + '/docs/CUSTOM_RELEASE.md).\n' + end
+          release = json.load(urllib.request.urlopen(urllib.request.Request(url, headers=headers))); assert release['tag_name'] == tag
+          start, end = '<!-- custom-builds:start -->', '<!-- custom-builds:end -->'; body = release.get('body') or ''
+          assert body.count(start) == body.count(end) and body.count(start) <= 1, 'ambiguous managed notes block'
+          block = start + '\n## Custom ARM64 builds\n\nSource: `https://github.com/cybito/herdr.git` at `' + source + '`; release `' + tag + '`.\n\n'
+          block += 'darwin-arm64 assets:\n' + rows[0][1] + '\nlinux-arm64 assets:\n' + rows[1][1] + '\nVerify downloaded files with `SHA256SUMS`.\n\n[Installation](https://github.com/cybito/herdr/blob/' + source + '/docs/CUSTOM_RELEASE.md).\n' + end
           if start in body:
-              left = body.index(start)
-              right = body.index(end)
-              assert right > left
+              left, right = body.index(start), body.index(end); assert right > left
               body = body[:left] + block + body[right + len(end):]
-          else:
-              body = body + ('\n\n' if body else '') + block
+          else: body = body + ('\n\n' if body else '') + block
           request = urllib.request.Request(url, headers={**headers, 'Content-Type': 'application/json'}, data=json.dumps({'body': body}).encode(), method='PATCH')
           urllib.request.urlopen(request).read()
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-              f.write(block + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f: f.write(block + '\n')
           PY
