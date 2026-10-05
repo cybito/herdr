@@ -36,7 +36,7 @@ jobs:
           with open(os.environ['GITHUB_EVENT_PATH']) as f: event = json.load(f)
           result = helper['validate_event'](event, os.environ['EXPECTED_REPOSITORY'])
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              for key, value in result.items(): f.write(f'{key}={value}\\n')
+              for key, value in result.items(): f.write(f'{key}={value}\n')
           PY
   build:
     needs: validate
