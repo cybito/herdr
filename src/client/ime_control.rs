@@ -383,7 +383,7 @@ mod local {
         }
         let uid = unsafe { libc::getuid() };
         let mut prefix = PathBuf::new();
-        let mut private = false;
+        let parent = path.parent();
         let mut components = path.components().peekable();
         while let Some(component) = components.next() {
             match component {
@@ -398,11 +398,7 @@ mod local {
             }
             let mode = metadata.mode();
             if components.peek().is_none() {
-                if !private
-                    || !metadata.file_type().is_socket()
-                    || metadata.uid() != uid
-                    || mode & 0o077 != 0
-                {
+                if !metadata.file_type().is_socket() || metadata.uid() != uid || mode & 0o077 != 0 {
                     return Err(fail("socket is not current-UID private"));
                 }
                 return Ok(metadata);
@@ -411,16 +407,15 @@ mod local {
                 return Err(fail("untrusted socket ancestor"));
             }
             // Root-owned sticky shared roots (e.g. /tmp) protect owned children
-            // from unlinking. A private current-UID directory is still required
-            // below them, and writable ancestors below that are never accepted.
-            let sticky_root = !private && metadata.uid() == 0 && mode & 0o1000 != 0;
+            // from unlinking. Shared ancestors may be readable/searchable by
+            // others; the immediate socket directory is the private boundary.
+            let sticky_root = metadata.uid() == 0 && mode & 0o1000 != 0;
             if mode & 0o022 != 0 && !sticky_root {
                 return Err(fail("externally writable socket ancestor"));
             }
-            if private && (metadata.uid() != uid || mode & 0o077 != 0) {
-                return Err(fail("socket ancestor escapes its private directory"));
+            if parent == Some(prefix.as_path()) && (metadata.uid() != uid || mode & 0o077 != 0) {
+                return Err(fail("socket directory is not current-UID private"));
             }
-            private |= metadata.uid() == uid && mode & 0o077 == 0;
         }
         Err(fail("missing socket filename"))
     }
@@ -1819,6 +1814,40 @@ mod tests {
         ));
         fixture.eof(1);
         worker.shutdown();
+    }
+
+    #[test]
+    fn socket_validation_accepts_shared_state_beneath_private_home() {
+        let fixture = Fixture::new();
+        // Keep the nested socket path within macOS's sockaddr_un length limit.
+        let state = fixture.root.join("s");
+        let run = state.join("r");
+        fs::create_dir_all(&run).unwrap();
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = run.join("c");
+        let _listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        for mode in [0o700, 0o750, 0o755] {
+            fs::set_permissions(&state, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                local::validate_socket(&path).is_ok(),
+                "safe shared state mode {mode:o} must be accepted beneath a private home"
+            );
+        }
+        for mode in [0o775, 0o777] {
+            fs::set_permissions(&state, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(matches!(
+                local::validate_socket(&path),
+                Err(ImeError::UnsafeSocket(_))
+            ));
+        }
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            local::validate_socket(&path),
+            Err(ImeError::UnsafeSocket(_))
+        ));
     }
 
     #[test]
