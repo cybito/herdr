@@ -689,10 +689,7 @@ impl ImeGate {
             Some(RawInputEvent::Mouse(mouse)) if mouse.kind == MouseEventKind::Moved => false,
             // Chrome mouse actions are Herdr commands; forwarded mouse traffic uses the
             // current terminal intent. A click on a different pane is staged below.
-            Some(RawInputEvent::Mouse(mouse))
-                if matches!(mouse.kind, MouseEventKind::Up(_))
-                    && shell.pane_mouse_gesture.is_some() =>
-            {
+            Some(RawInputEvent::Mouse(mouse)) if matches!(mouse.kind, MouseEventKind::Up(_)) => {
                 false
             }
             // Popup/Pending occludes all underlying pane/chrome hits, including
@@ -913,10 +910,7 @@ impl ImeGate {
             .is_some_and(|batch| batch.focus_target.is_some());
         self.release_ready = self.batches.front().is_some_and(|batch| {
             batch.pending_outcome.is_none()
-                && batch
-                    .events
-                    .front()
-                    .is_some_and(|event| is_balancing_release(event, shell))
+                && batch.events.front().is_some_and(|event| is_release(event))
         });
         self.copy_blocked = shell.copy_operation_in_flight;
     }
@@ -1068,8 +1062,7 @@ impl ImeGate {
             .batches
             .front()
             .is_some_and(|batch| batch.pending_outcome.is_some());
-        self.release_ready =
-            !pending_action && event.is_some_and(|event| is_balancing_release(event, shell));
+        self.release_ready = !pending_action && event.is_some_and(|event| is_release(event));
         let local_command = pending_action || Self::local_command_event(shell, event);
         let cached = self
             .cache
@@ -1293,6 +1286,25 @@ impl ImeGate {
                     continue;
                 }
             }
+            if let RawInputEvent::Mouse(mouse) = &event {
+                if let MouseEventKind::Up(button) = mouse.kind {
+                    // A buffered press must run before its release, even when
+                    // both arrive in one parser chunk or separate chunks.
+                    let matching_press = |event: &RawInputEvent| {
+                        matches!(event, RawInputEvent::Mouse(mouse)
+                            if mouse.kind == MouseEventKind::Down(button))
+                    };
+                    if self
+                        .batches
+                        .iter()
+                        .any(|batch| batch.events.iter().any(matching_press))
+                        || semantic.iter().skip(remaining).any(matching_press)
+                    {
+                        semantic.push_back(event);
+                        continue;
+                    }
+                }
+            }
             // Endpoint chrome is client-owned, not input for the frozen pane.
             // Keep its selection and balancing release on the native mouse route.
             let recovery_mouse = frozen
@@ -1308,7 +1320,9 @@ impl ImeGate {
                     &event,
                     RawInputEvent::OuterFocusLost | RawInputEvent::OuterFocusGained
                 )
-                || matches!(&event, RawInputEvent::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Up(button) if shell.pane_mouse_gesture.as_ref().is_some_and(|gesture| gesture.button == button)))
+                // Native mouse handling settles retained chrome/terminal
+                // gestures and ignores orphan releases without a new lease.
+                || matches!(&event, RawInputEvent::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Up(_)))
                 || !matches!(
                     &event,
                     RawInputEvent::Key(_)
@@ -1561,10 +1575,7 @@ impl ImeGate {
             self.synchronize(shell, endpoints, frozen, now)?;
             return Ok(Some(ClientShellInput { repaint: true, ..Default::default() }));
         }
-        let release = batch
-            .events
-            .front()
-            .is_some_and(|event| is_balancing_release(event, shell));
+        let release = batch.events.front().is_some_and(|event| is_release(event));
         if !release
             && ((!self.applied && !self.disabled) || self.copy_blocked || self.waiting_target)
         {
@@ -1744,11 +1755,6 @@ impl ImeGate {
 fn is_release(event: &RawInputEvent) -> bool {
     matches!(event, RawInputEvent::Key(key) if key.kind == KeyEventKind::Release)
         || matches!(event, RawInputEvent::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Up(_)))
-}
-
-fn is_balancing_release(event: &RawInputEvent, shell: &ClientShellState) -> bool {
-    matches!(event, RawInputEvent::Key(key) if key.kind == KeyEventKind::Release)
-        || matches!(event, RawInputEvent::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Up(button) if shell.pane_mouse_gesture.as_ref().is_some_and(|gesture| gesture.button == button)))
 }
 
 fn merge(target: &mut ClientShellInput, mut source: ClientShellInput) {
@@ -3553,6 +3559,101 @@ mod tests {
             assert_eq!(gate.desired.as_ref().unwrap().state, InputIntentState::Text);
             assert_eq!(shell.focused_pane_id().as_deref(), Some("pane_1"));
             assert!(shell.tab_press.is_none());
+        }
+    }
+
+    #[test]
+    fn mouse_release_after_workspace_change_does_not_acquire_or_disable_ime() {
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            let (mut gate, mut shell, mut registry, _) = fixture(None);
+            let now = Instant::now();
+            gate.synchronize(&mut shell, &registry, false, now).unwrap();
+            applied(&mut gate);
+            let mut snapshot = shell.snapshot.as_ref().unwrap().as_ref().clone();
+            snapshot.revision += 1;
+            snapshot.panes[0].terminal_id = Some("terminal-2".into());
+            shell.set_endpoint_snapshot_for_generation(
+                &ClientEndpointId::Local,
+                1,
+                Box::new(snapshot),
+            );
+            gate.synchronize(&mut shell, &registry, false, now).unwrap();
+            applied(&mut gate);
+            assert!(!gate.episode);
+            let outcome = gate
+                .enqueue(
+                    &mut shell,
+                    &registry,
+                    Vec::new(),
+                    vec![RawInputEvent::Mouse(MouseEvent {
+                        kind: MouseEventKind::Up(button),
+                        column: 0,
+                        row: 0,
+                        modifiers: KeyModifiers::NONE,
+                    })],
+                    None,
+                    false,
+                    now,
+                )
+                .unwrap();
+            assert!(outcome.actions.is_empty() && outcome.routed_requests.is_empty());
+            assert!(gate.batches.is_empty() && gate.desired.is_none());
+            assert!(!gate.episode);
+            gate.synchronize(&mut shell, &registry, false, now + INPUT_WAIT)
+                .unwrap();
+            assert!(gate.enabled());
+            assert!(dispatch(&mut gate, &mut shell, &mut registry, now + INPUT_WAIT).is_none());
+        }
+    }
+
+    #[test]
+    fn buffered_chrome_release_stays_after_press_without_requiring_another_ack() {
+        for separate_chunks in [false, true] {
+            let (mut gate, mut shell, mut registry, _) = fixture(Some(InputIntentState::Text));
+            shell.compose(100, 28).unwrap();
+            let rect = shell.hits.tabs[0].0;
+            let event = |kind| {
+                RawInputEvent::Mouse(MouseEvent {
+                    kind,
+                    column: rect.x,
+                    row: rect.y,
+                    modifiers: KeyModifiers::NONE,
+                })
+            };
+            let now = Instant::now();
+            let mut events = vec![event(MouseEventKind::Down(MouseButton::Left))];
+            if !separate_chunks {
+                events.push(event(MouseEventKind::Up(MouseButton::Left)));
+            }
+            gate.enqueue(&mut shell, &registry, Vec::new(), events, None, false, now)
+                .unwrap();
+            if separate_chunks {
+                gate.enqueue(
+                    &mut shell,
+                    &registry,
+                    Vec::new(),
+                    vec![event(MouseEventKind::Up(MouseButton::Left))],
+                    None,
+                    false,
+                    now,
+                )
+                .unwrap();
+            }
+            assert!(shell.tab_press.is_none());
+            assert!(dispatch(&mut gate, &mut shell, &mut registry, now).is_none());
+            applied(&mut gate);
+            let press = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+            assert!(press.actions.is_empty());
+            assert!(shell.tab_press.is_some());
+            gate.applied = false;
+            gate.inactive = true;
+            gate.episode = false;
+            let release = dispatch(&mut gate, &mut shell, &mut registry, now).unwrap();
+            assert_eq!(release.actions.len(), 1);
+            assert!(shell.tab_press.is_none() && gate.batches.is_empty());
+            gate.synchronize(&mut shell, &registry, false, now + INPUT_WAIT)
+                .unwrap();
+            assert!(gate.enabled());
         }
     }
 
