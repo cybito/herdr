@@ -985,6 +985,13 @@ async fn run_client_loop(
                     }
                     if let Some(gate) = ime_gate.as_mut() {
                         let shell = state.shell.as_mut().expect("checked shell mode");
+                        gate.retry_on_prefix(
+                            shell,
+                            &write_stream,
+                            &events,
+                            pending_activation.is_some(),
+                            || shell::ImeGate::start(event_tx.clone()),
+                        );
                         let outcome = gate.enqueue(
                             shell,
                             &write_stream,
@@ -2330,10 +2337,13 @@ async fn run_client_loop(
                                 ) {
                                     Ok(false) => continue,
                                     Ok(true) => {}
-                                    Err(_) => {
+                                    Err(error) => {
                                         // Missing optional IME metadata retires only
                                         // this client's enhancement, not the endpoint.
                                         if let Some(gate) = ime_gate.as_mut() {
+                                            if gate.enabled() {
+                                                tracing::warn!(%error, "IME_ENDPOINT_METADATA_REJECTED");
+                                            }
                                             gate.disable();
                                         }
                                         shell.disable_ime_control();

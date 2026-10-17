@@ -104,7 +104,8 @@ impl ImeGate {
     pub(in crate::client) fn start(sender: tokio::sync::mpsc::Sender<ClientLoopEvent>) -> Self {
         match ImeWorker::start(sender) {
             Ok(worker) => Self::with_worker(Some(worker)),
-            Err(_) => {
+            Err(error) => {
+                tracing::warn!(%error, "IME_WORKER_START_FAILED");
                 let mut gate = Self::with_worker(None);
                 gate.disable();
                 gate
@@ -185,9 +186,87 @@ impl ImeGate {
         !self.disabled
     }
 
+    #[cfg(any(unix, test))]
+    pub(in crate::client) fn retry_on_prefix(
+        &mut self,
+        shell: &mut ClientShellState,
+        endpoints: &EndpointRegistry,
+        events: &[RawInputEvent],
+        frozen: bool,
+        start: impl FnOnce() -> Self,
+    ) -> bool {
+        // This is a new user request, never a retry of the failed input/lease.
+        // Finish plain dispatch and bound releases before replacing their gate.
+        if self.enabled()
+            || !shell.ime_control_requested
+            || !self.batches.is_empty()
+            || !self.pending_releases.routed_requests.is_empty()
+            || frozen
+            || !endpoints.active_surface_available()
+            || shell.mode != ClientShellMode::Terminal
+            || shell.overlay.is_some()
+            || shell.modal_paste_target_active()
+        {
+            return false;
+        }
+        let mut focused = shell.outer_focused != Some(false);
+        let prefix = events.iter().find_map(|event| match event {
+            RawInputEvent::OuterFocusGained => {
+                focused = true;
+                None
+            }
+            RawInputEvent::OuterFocusLost => Some(false),
+            RawInputEvent::Key(key) => Some(
+                focused
+                    && key.kind == KeyEventKind::Press
+                    && shell.config.keybinds.matches_prefix(key),
+            ),
+            RawInputEvent::Text(_) | RawInputEvent::Paste(_) | RawInputEvent::Mouse(_) => {
+                Some(false)
+            }
+            _ => None,
+        });
+        if prefix != Some(true)
+            || crate::client::shell_runtime::require_client_input_intents(
+                Some(shell),
+                endpoints,
+                true,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let mut replacement = start();
+        if !replacement.enabled() {
+            return false;
+        }
+        // Completions from the retired worker can still be in the event channel.
+        // Their old tuples must never authorize the replacement's first input.
+        replacement.focus_epoch = self.focus_epoch.wrapping_add(1);
+        replacement.arbitration_epoch = self.arbitration_epoch.wrapping_add(1);
+        *self = replacement;
+        shell.enable_ime_control();
+        tracing::info!("IME_CONTROL_RETRY_ON_PREFIX");
+        true
+    }
+
+    #[track_caller]
     pub(in crate::client) fn disable(&mut self) {
+        if !self.disabled {
+            let caller = std::panic::Location::caller();
+            tracing::warn!(
+                file = caller.file(),
+                line = caller.line(),
+                batches = self.batches.len(),
+                bytes = self.bytes,
+                applied = self.applied,
+                submitted = self.submitted,
+                waiting_target = self.waiting_target,
+                "IME_CONTROL_DISABLED"
+            );
+        }
         self.disabled = true;
-        // Dropping the worker closes its streams; no retry or old-mode replay.
+        // Dropping the worker closes its streams; its old lease is never retried.
         self.worker = None;
         self.authorization = None;
         self.desired = None;
@@ -320,10 +399,10 @@ impl ImeGate {
                 }
                 continue;
             }
-            let roster = snapshot
-                .input_intents
-                .as_ref()
-                .ok_or(ClientError::InputIntentProtocolError)?;
+            let roster = snapshot.input_intents.as_ref().ok_or_else(|| {
+                tracing::warn!("IME_ROSTER_MISSING");
+                ClientError::InputIntentProtocolError
+            })?;
             let index = self
                 .cache
                 .iter()
@@ -393,6 +472,7 @@ impl ImeGate {
                         .count()
                         > 1
                 {
+                    tracing::warn!("IME_ROSTER_TERMINAL_INVALID");
                     return Err(ClientError::InputIntentProtocolError);
                 }
                 let target: Arc<str> = previous
@@ -415,6 +495,7 @@ impl ImeGate {
                         || session.generation == 0
                         || reporters.contains_key(&session.session)
                     {
+                        tracing::warn!("IME_ROSTER_SESSION_INVALID");
                         return Err(ClientError::InputIntentProtocolError);
                     }
                     let identity = previous
@@ -804,6 +885,7 @@ impl ImeGate {
             && shell.ime_control_enabled
             && self
                 .synchronize_enabled(shell, endpoints, frozen, now)
+                .inspect_err(|error| tracing::warn!(%error, "IME_SYNCHRONIZE_FAILED"))
                 .is_ok()
         {
             return Ok(());
@@ -909,8 +991,7 @@ impl ImeGate {
             .front()
             .is_some_and(|batch| batch.focus_target.is_some());
         self.release_ready = self.batches.front().is_some_and(|batch| {
-            batch.pending_outcome.is_none()
-                && batch.events.front().is_some_and(|event| is_release(event))
+            batch.pending_outcome.is_none() && batch.events.front().is_some_and(is_release)
         });
         self.copy_blocked = shell.copy_operation_in_flight;
     }
@@ -959,6 +1040,7 @@ impl ImeGate {
         {
             // An ordinary pane route can remain usable without the optional
             // terminal identity needed to acquire an IME lease.
+            tracing::warn!("IME_ACTIVE_TERMINAL_MISSING");
             return Err(ClientError::InputIntentProtocolError);
         }
         let (popup_continuation, popup_waiting) =
@@ -1049,6 +1131,7 @@ impl ImeGate {
             });
         }
         if self.mouse_focus_wait_finished(shell, now) {
+            tracing::warn!("IME_MOUSE_FOCUS_TIMEOUT");
             return Err(ClientError::ImeAckTimeout);
         }
         shell.input_route = self.binding.as_ref().map(|binding| binding.route.clone());
@@ -1062,7 +1145,7 @@ impl ImeGate {
             .batches
             .front()
             .is_some_and(|batch| batch.pending_outcome.is_some());
-        self.release_ready = !pending_action && event.is_some_and(|event| is_release(event));
+        self.release_ready = !pending_action && event.is_some_and(is_release);
         let local_command = pending_action || Self::local_command_event(shell, event);
         let cached = self
             .cache
@@ -1182,6 +1265,7 @@ impl ImeGate {
         }
         if let Some(deadline) = self.deadline() {
             if now >= deadline {
+                tracing::warn!("IME_INPUT_WAIT_TIMEOUT");
                 return Err(ClientError::ImeAckTimeout);
             }
         }
@@ -1227,7 +1311,8 @@ impl ImeGate {
         }
         let scope = match completion.result {
             Ok(scope) => scope,
-            Err(_) => {
+            Err(error) => {
+                tracing::warn!(%error, "IME_WORKER_COMPLETION_FAILED");
                 self.disable();
                 return Ok(());
             }
@@ -1361,6 +1446,7 @@ impl ImeGate {
                     endpoints,
                     true,
                 )
+                .inspect_err(|error| tracing::warn!(%error, "IME_INPUT_INTENT_REQUIREMENT_FAILED"))
                 .is_err()
             {
                 self.disable();
@@ -1575,7 +1661,7 @@ impl ImeGate {
             self.synchronize(shell, endpoints, frozen, now)?;
             return Ok(Some(ClientShellInput { repaint: true, ..Default::default() }));
         }
-        let release = batch.events.front().is_some_and(|event| is_release(event));
+        let release = batch.events.front().is_some_and(is_release);
         if !release
             && ((!self.applied && !self.disabled) || self.copy_blocked || self.waiting_target)
         {
@@ -1774,7 +1860,16 @@ impl ClientShellState {
         self.ime_control_requested = true;
         self.pending_input_source_changes.clear();
     }
+    #[track_caller]
     pub(in crate::client) fn disable_ime_control(&mut self) {
+        if self.ime_control_enabled {
+            let caller = std::panic::Location::caller();
+            tracing::warn!(
+                file = caller.file(),
+                line = caller.line(),
+                "IME_SHELL_DISABLED"
+            );
+        }
         self.ime_control_enabled = false;
         self.ime_authorization = None;
         self.ime_input_deadline = None;
@@ -2490,6 +2585,146 @@ mod tests {
         shell.reconcile_input_source();
         assert!(shell.take_input_source_changes().is_empty());
         assert!(shell.ime_authorization.is_none() && !gate.applied);
+    }
+
+    #[test]
+    fn fresh_prefix_after_failure_retries_with_new_authorization_and_no_old_input() {
+        let (mut gate, mut shell, mut registry, messages) = fixture(Some(InputIntentState::Text));
+        let now = Instant::now();
+        enqueue(&mut gate, &mut shell, &registry, b"x", now);
+        let old = gate.authorization.as_ref().unwrap().clone();
+        gate.complete(Completion {
+            authorization: old.clone(),
+            result: Err(crate::client::ime_control::ImeError::Timeout),
+        })
+        .unwrap();
+        while let Some(outcome) = dispatch(&mut gate, &mut shell, &mut registry, now) {
+            send(&shell, &mut registry, outcome);
+        }
+        assert!(gate.batches.is_empty() && !gate.enabled());
+        assert_eq!(messages.try_iter().count(), 1);
+        let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x02");
+        assert!(
+            gate.retry_on_prefix(&mut shell, &registry, &events, false, || {
+                ImeGate::with_worker(None)
+            })
+        );
+        enqueue(&mut gate, &mut shell, &registry, b"\x02", now);
+        let fresh = gate.authorization.as_ref().unwrap().clone();
+        assert_ne!(fresh.focus_epoch, old.focus_epoch);
+        assert!(gate.pending_plan.as_ref().is_some_and(|plan| {
+            plan.start_episode
+                && plan
+                    .desired
+                    .as_ref()
+                    .is_some_and(|lease| lease.state == InputIntentState::Command)
+        }));
+        gate.complete(Completion {
+            authorization: old,
+            result: Ok(AckScope::Applied),
+        })
+        .unwrap();
+        assert!(!gate.applied && !gate.authorized());
+        assert!(dispatch(&mut gate, &mut shell, &mut registry, now).is_none());
+        assert!(messages.try_recv().is_err());
+        applied(&mut gate);
+        dispatch(&mut gate, &mut shell, &mut registry, now);
+        assert_eq!(shell.mode, ClientShellMode::Prefix);
+    }
+
+    #[test]
+    fn retry_does_not_replace_retained_input_or_start_on_other_events() {
+        let (mut gate, mut shell, mut registry, _) = fixture(Some(InputIntentState::Text));
+        let now = Instant::now();
+        enqueue(&mut gate, &mut shell, &registry, b"x", now);
+        gate.complete(Completion {
+            authorization: gate.authorization.as_ref().unwrap().clone(),
+            result: Err(crate::client::ime_control::ImeError::Timeout),
+        })
+        .unwrap();
+        let prefix = crate::raw_input::parse_raw_input_bytes_sync(b"\x02");
+        assert!(
+            !gate.retry_on_prefix(&mut shell, &registry, &prefix, false, || {
+                panic!("retained input must drain before a retry")
+            })
+        );
+        assert_eq!(gate.batches.front().unwrap().raw, b"x");
+        while dispatch(&mut gate, &mut shell, &mut registry, now).is_some() {}
+        for events in [
+            crate::raw_input::parse_raw_input_bytes_sync(b"x"),
+            vec![RawInputEvent::OuterFocusGained],
+            vec![RawInputEvent::OuterFocusLost],
+        ] {
+            assert!(
+                !gate.retry_on_prefix(&mut shell, &registry, &events, false, || {
+                    panic!("only a real prefix press can request a retry")
+                })
+            );
+        }
+        assert!(
+            !gate.retry_on_prefix(&mut shell, &registry, &prefix, true, || {
+                panic!("an endpoint handoff cannot start a retry")
+            })
+        );
+    }
+
+    #[test]
+    fn retry_requires_opt_in_foreground_press_and_preserves_failed_start() {
+        let prefix = crate::raw_input::parse_raw_input_bytes_sync(b"\x02");
+        for case in [
+            "healthy",
+            "not_requested",
+            "unfocused",
+            "release",
+            "prefix_mode",
+            "missing_roster",
+        ] {
+            let (mut gate, mut shell, registry, _) = fixture(Some(InputIntentState::Text));
+            if case != "healthy" {
+                gate.disable();
+                shell.disable_ime_control();
+            }
+            let mut events = crate::raw_input::parse_raw_input_bytes_sync(b"\x02");
+            match case {
+                "not_requested" => shell.ime_control_requested = false,
+                "unfocused" => shell.outer_focused = Some(false),
+                "release" => {
+                    if let RawInputEvent::Key(key) = &mut events[0] {
+                        key.kind = KeyEventKind::Release;
+                    }
+                }
+                "prefix_mode" => shell.mode = ClientShellMode::Prefix,
+                "missing_roster" => {
+                    shell.snapshot.as_mut().unwrap().input_intents = None;
+                    shell.endpoints[0].snapshot.as_mut().unwrap().input_intents = None;
+                }
+                _ => {}
+            }
+            assert!(
+                !gate.retry_on_prefix(&mut shell, &registry, &events, false, || {
+                    panic!("{case} cannot request a retry")
+                })
+            );
+        }
+        let (mut gate, mut shell, registry, _) = fixture(Some(InputIntentState::Text));
+        gate.disable();
+        shell.disable_ime_control();
+        assert!(
+            !gate.retry_on_prefix(&mut shell, &registry, &prefix, false, || {
+                let mut failed = ImeGate::with_worker(None);
+                failed.disable();
+                failed
+            })
+        );
+        assert!(!gate.enabled() && !shell.ime_control_enabled);
+        let mut focused_prefix = vec![RawInputEvent::OuterFocusGained];
+        focused_prefix.extend(prefix);
+        shell.outer_focused = Some(false);
+        assert!(
+            gate.retry_on_prefix(&mut shell, &registry, &focused_prefix, false, || {
+                ImeGate::with_worker(None)
+            })
+        );
     }
 
     #[test]

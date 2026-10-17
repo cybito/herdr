@@ -194,6 +194,7 @@ impl ImeWorker {
                     local::run(path, &worker_shared, &completion_sender);
                 }));
                 if result.is_err() {
+                    tracing::warn!("IME_WORKER_PANICKED");
                     worker_shared.stop();
                     let latest_key = lock(&worker_shared.mailbox).latest_key.clone();
                     if let Some(key) = latest_key {
@@ -1095,7 +1096,16 @@ mod local {
                         ));
                     }
                     Ok(_) => {}
-                    Err(error) => break Some(error),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            stage = "reconcile",
+                            revision = queued.revision,
+                            start_episode = queued.plan.start_episode,
+                            "IME_WORKER_STOPPED"
+                        );
+                        break Some(error);
+                    }
                 }
                 continue;
             }
@@ -1104,6 +1114,7 @@ mod local {
                 .values()
                 .find_map(|connection| connection.check_idle().err())
             {
+                tracing::warn!(%error, stage = "idle", "IME_WORKER_STOPPED");
                 break Some(error);
             }
             let mailbox = lock(&shared.mailbox);

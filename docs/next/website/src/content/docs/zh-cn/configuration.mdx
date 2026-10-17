@@ -604,6 +604,8 @@ server 的 `scope:recorded` ACK 只表示意图已保存。聚焦 client 将该�
 
 本机图形会话、daemon、socket、后端、foreground observer、worker 或当前 ACK 不可用时，客户端静默退化为普通终端。IME FIFO 门禁限 256 batches、2MiB、5s；达到边界时也只关闭增强，当前与排队的未发送输入继续派发，保留已消费的事件游标与待发命令，不重放 prefix 或鼠标焦点动作。已发送按键／鼠标的 release 仍走原 route，不等待新 ACK；正常焦点、terminal 和 connection generation 边界仍防止错误目标派发。失败清除本机源授权、关闭 stream，不重试旧模式，不伪造 `applied` 或英文保护，不弹出 IME 通知。网络收到意图前或外层 IME 已消费的首字符无法由此保护。正常 Linux 增强仍要求独立、可信的 Hyprland foreground observer，不能用 daemon 存活或 reporter 的 FocusLost 代替真实图形焦点。
 
+退化后，新的前台 prefix 按键（默认 Ctrl+B）可以显式重新尝试 IME 协作，不必重启客户端。重试只在普通 Terminal 模式、无覆盖层、连接投影完整且旧输入与 release 已派发完毕后进行；新 worker 重新取得当前输入意图及本机 ACK，旧 worker 的 ACK 不能授权新输入。普通键、后台快照、FocusIn 或网络重连本身不会触发重试，也不会重放旧输入或重新启用 direct-switch。daemon 仍为 `UNKNOWN` 时会继续拒绝协作，prefix 重试不会清除恢复记录或冒充服务已恢复。
+
 已派发的鼠标 `pane.focus` 用实际 request ID 跟踪结果；Generic 拒绝／超时结束 IME 等待，成功 ACK 仍须真实焦点投影，投影或响应缺失最多等待该 batch 原始 5 秒截止时间。退化后也保留此截止时间，不因关闭 IME 变成无限等待。失败后原 click 的 down/drag/up 按普通输入继续，已开始手势的 drag/up 保留捕获的 route，已发送的 focus proposal 不重发；仍在原 route 捕获的键不会跟随 click 投往新 pane，后续普通输入、导航与分离不会被 IME FIFO 卡住。可见但未聚焦的 pane 缺少 `terminal_id` 时也只关闭增强；普通输入 route 保留 endpoint／generation／boot／pane 与缺失身份的真实 `None`，不创建 IME lease 或伪造 `applied`。
 
 Unix 会话目录以 `0700` 创建；已有的当前用户所有、无外部写入权限且可读写的目录会安全收窄为 `0700`，保留目录身份和会话数据。路径须为绝对规范路径，拒绝用户可替换的目录符号链接；仅允许只读 root 所有父目录中的 root 所有系统祖先别名，并逐组件验证解析目标。外部可写、非当前用户所有或只读的会话目录会被拒绝，不自动接管；这不放宽本机 IME guard 的 socket 信任规则。
