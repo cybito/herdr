@@ -578,6 +578,14 @@ async fn run_client_loop(
             })
         })
         .flatten();
+    tracing::info!(
+        pid = std::process::id(),
+        configured = config.ime_control_enabled,
+        shell_present = state.shell.is_some(),
+        gate_present = ime_gate.is_some(),
+        gate_enabled = ime_gate.as_ref().is_some_and(shell::ImeGate::enabled),
+        "IME_CONTROL_STARTUP"
+    );
     let (supervisor_tx, mut supervisor_rx) =
         tokio::sync::mpsc::channel::<endpoint::EndpointSupervisorEvent>(64);
     // Keep Windows console draining independent of server-frame backpressure.

@@ -1251,6 +1251,26 @@ impl ImeGate {
             && self.ui_context.as_ref() == Some(&context);
         self.ui_context = Some(context);
         if !same {
+            tracing::info!(
+                pid = std::process::id(),
+                mode = ?shell.mode,
+                overlay = ?shell.overlay.as_ref().map(ClientShellOverlay::kind),
+                local_command,
+                pending_action,
+                copy_mode = shell.copy_mode.is_some(),
+                selection_visible = shell.selection.as_ref().is_some_and(crate::selection::Selection::is_visible),
+                forward_prefix = shell.ime_forward_prefix,
+                terminal = ?self.binding.as_ref().and_then(|binding| binding.terminal.as_deref()),
+                target = ?identity.terminal_target,
+                reporter = ?identity.reporter_session,
+                desired = ?desired.as_ref().map(|lease| (lease.policy, lease.state)),
+                focused = self.focused,
+                frozen,
+                waiting_target = self.waiting_target,
+                intent_generation = generation,
+                focus_epoch = self.focus_epoch,
+                "IME_ARBITRATION_CHANGED"
+            );
             self.arbitration_epoch = self.arbitration_epoch.wrapping_add(1);
             self.authorization = Some(Arc::new(AuthorizationKey {
                 identity,

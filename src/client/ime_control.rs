@@ -190,6 +190,7 @@ impl ImeWorker {
         let thread = thread::Builder::new()
             .name("herdr-ime-control".into())
             .spawn(move || {
+                tracing::info!(pid = std::process::id(), "IME_WORKER_ENTERED");
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     local::run(path, &worker_shared, &completion_sender);
                 }));
@@ -212,9 +213,11 @@ impl ImeWorker {
                 // Shutdown clones must not retain descriptors after the owning
                 // sockets have gone away, including an unwinding worker.
                 lock(&worker_shared.sockets).clear();
+                tracing::info!(pid = std::process::id(), "IME_WORKER_EXITED");
                 let _ = finished_tx.send(());
             })
             .map_err(|error| ImeError::Transport(error.to_string()))?;
+        tracing::info!(pid = std::process::id(), "IME_WORKER_CREATED");
         Ok(Self {
             shared,
             thread: Some(thread),
