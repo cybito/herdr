@@ -939,8 +939,15 @@ async fn native_file_render_scale_profile() {
     const SAMPLES: usize = 35;
     const IMAGE_WIDTH: u32 = 800;
     const IMAGE_HEIGHT: u32 = 480;
+    // Kernel source snapshots are Linux-only. Other platforms still profile
+    // decoded and native-file delivery without claiming CoW source retention.
+    const CASES: &[(bool, bool)] = if cfg!(target_os = "linux") {
+        &[(false, false), (true, false), (true, true)]
+    } else {
+        &[(false, false), (true, false)]
+    };
     for count in [1, 15] {
-        for (native, source_retention) in [(false, false), (true, false), (true, true)] {
+        for &(native, source_retention) in CASES {
             let (mut server, _control, _render, root) =
                 retained_test_server_with_control(b"populated root terminal\r\n");
             if source_retention {

@@ -1,2 +1,5 @@
 * text=auto eol=lf
 packaging/windows/licenses/* binary
+
+# Unified patches require space-prefixed blank context lines.
+vendor/patches/**/*.patch -whitespace

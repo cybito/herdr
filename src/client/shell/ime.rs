@@ -2038,7 +2038,7 @@ mod tests {
             shell,
             registry,
             bytes.to_vec(),
-            crate::raw_input::parse_raw_input_bytes_sync(bytes),
+            crate::raw_input::parse_framed_input(bytes),
             None,
             false,
             now,
@@ -2182,7 +2182,7 @@ mod tests {
                     rect.y + 1,
                 )
                 .into_bytes();
-                let events = crate::raw_input::parse_raw_input_bytes_sync(&raw);
+                let events = crate::raw_input::parse_framed_input(&raw);
                 let outcome = gate
                     .enqueue(
                         &mut shell,
@@ -2265,7 +2265,7 @@ mod tests {
                 &mut shell,
                 &registry,
                 b"j".to_vec(),
-                crate::raw_input::parse_raw_input_bytes_sync(b"j"),
+                crate::raw_input::parse_framed_input(b"j"),
                 None,
                 false,
                 now,
@@ -2623,7 +2623,7 @@ mod tests {
         }
         assert!(gate.batches.is_empty() && !gate.enabled());
         assert_eq!(messages.try_iter().count(), 1);
-        let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x02");
+        let events = crate::raw_input::parse_framed_input(b"\x02");
         assert!(
             gate.retry_on_prefix(&mut shell, &registry, &events, false, || {
                 ImeGate::with_worker(None)
@@ -2662,7 +2662,7 @@ mod tests {
             result: Err(crate::client::ime_control::ImeError::Timeout),
         })
         .unwrap();
-        let prefix = crate::raw_input::parse_raw_input_bytes_sync(b"\x02");
+        let prefix = crate::raw_input::parse_framed_input(b"\x02");
         assert!(
             !gate.retry_on_prefix(&mut shell, &registry, &prefix, false, || {
                 panic!("retained input must drain before a retry")
@@ -2671,7 +2671,7 @@ mod tests {
         assert_eq!(gate.batches.front().unwrap().raw, b"x");
         while dispatch(&mut gate, &mut shell, &mut registry, now).is_some() {}
         for events in [
-            crate::raw_input::parse_raw_input_bytes_sync(b"x"),
+            crate::raw_input::parse_framed_input(b"x"),
             vec![RawInputEvent::OuterFocusGained],
             vec![RawInputEvent::OuterFocusLost],
         ] {
@@ -2690,7 +2690,7 @@ mod tests {
 
     #[test]
     fn retry_requires_opt_in_foreground_press_and_preserves_failed_start() {
-        let prefix = crate::raw_input::parse_raw_input_bytes_sync(b"\x02");
+        let prefix = crate::raw_input::parse_framed_input(b"\x02");
         for case in [
             "healthy",
             "not_requested",
@@ -2704,7 +2704,7 @@ mod tests {
                 gate.disable();
                 shell.disable_ime_control();
             }
-            let mut events = crate::raw_input::parse_raw_input_bytes_sync(b"\x02");
+            let mut events = crate::raw_input::parse_framed_input(b"\x02");
             match case {
                 "not_requested" => shell.ime_control_requested = false,
                 "unfocused" => shell.outer_focused = Some(false),
@@ -3262,7 +3262,7 @@ mod tests {
                 chunks.extend(framer.flush_timeout());
             }
             for chunk in chunks {
-                let events = crate::raw_input::parse_raw_input_bytes_sync(&chunk);
+                let events = crate::raw_input::parse_framed_input(&chunk);
                 gate.enqueue(&mut shell, &registry, chunk, events, None, false, now)
                     .unwrap();
             }
@@ -3525,7 +3525,7 @@ mod tests {
             &mut shell,
             &registry,
             b"y".to_vec(),
-            crate::raw_input::parse_raw_input_bytes_sync(b"y"),
+            crate::raw_input::parse_framed_input(b"y"),
             None,
             false,
             now,
