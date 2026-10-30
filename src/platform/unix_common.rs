@@ -335,6 +335,20 @@ pub(crate) fn local_stream_peer_description(stream: &crate::ipc::LocalStream) ->
     Some(description)
 }
 
+/// Pid of the process that connected the local socket, when the OS reports it.
+pub(crate) fn local_stream_peer_pid(stream: &crate::ipc::LocalStream) -> Option<u32> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    let crate::ipc::LocalStream::UdSocket(socket) = stream;
+    super::socket_peer_pid(socket.as_fd().as_raw_fd())
+}
+
+/// Process group of a live process, or `None` once it is gone.
+pub(crate) fn process_group_id(pid: u32) -> Option<u32> {
+    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+    (pgid > 0).then_some(pgid as u32)
+}
+
 pub(crate) fn begin_cli_output() {
     set_sigpipe_disposition(libc::SIG_DFL);
 }
@@ -561,6 +575,24 @@ pub(crate) fn set_default_plugin_pane_pwd(env: &mut Vec<(String, String)>, cwd: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_group_id_distinguishes_a_child_in_its_own_group() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let own = process_group_id(std::process::id()).unwrap();
+        let child_group = process_group_id(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(child_group, Some(child.id()));
+        assert_ne!(child_group, Some(own));
+        assert_eq!(process_group_id(child.id()), None);
+    }
 
     #[test]
     fn server_signal_monitor_survives_hangup_and_reports_terminate() {

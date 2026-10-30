@@ -400,6 +400,9 @@ pub struct PaneInputIntentStreamParams {
     pub popup_terminal_id: Option<String>,
     #[serde(skip)]
     pub owner: String,
+    /// Socket peer pid, set by the server transport and never read from the wire.
+    #[serde(skip)]
+    pub peer_pid: Option<u32>,
 }
 
 impl schemars::JsonSchema for PaneInputIntentStreamParams {
@@ -455,6 +458,8 @@ pub enum InputIntentOperation {
 pub struct PaneInputIntentStreamOperationParams {
     pub session: String,
     pub operation: InputIntentOperation,
+    /// Socket peer pid, set by the server transport.
+    pub peer_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

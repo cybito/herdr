@@ -121,6 +121,14 @@ impl App {
                 );
             }
         };
+        if let Err(rejection) = self.input_intent_foreground_gate(&terminal_id, params.peer_pid) {
+            rejection.log("pane.input_intent.stream.open", &terminal_id, &params.owner);
+            return crate::app::api::responses::encode_error(
+                id,
+                "not_foreground_process_group",
+                "pane input intent streams only accept the terminal's foreground process group",
+            );
+        }
         if stream_active.is_some_and(|active| !active.load(Ordering::Acquire)) {
             return crate::app::api::responses::encode_error(
                 id,
@@ -175,6 +183,33 @@ impl App {
                 None,
                 Some("TIMEOUT"),
             );
+        }
+        let gated = (!matches!(params.operation, InputIntentOperation::Close {}))
+            .then(|| self.input_intents.terminal_for(&params.session))
+            .flatten();
+        if let Some(terminal_id) = gated {
+            if let Err(rejection) = self.input_intent_foreground_gate(&terminal_id, params.peer_pid)
+            {
+                rejection.log(
+                    "pane.input_intent.stream.operation",
+                    &terminal_id,
+                    &params.session,
+                );
+                // Same outcome as a superseded reporter: the lease is retired and
+                // the reporter disables itself on STALE_LEASE.
+                if self.input_intents.retire_session(&params.session) {
+                    self.input_intents_changed();
+                }
+                return self.operation_ack(
+                    false,
+                    self.input_intents
+                        .generation_for(&params.session)
+                        .unwrap_or(0),
+                    &params.session,
+                    None,
+                    Some("STALE_LEASE"),
+                );
+            }
         }
         self.apply_input_intent_operation(&params.session, &params.operation)
     }
@@ -240,6 +275,49 @@ impl App {
         })
     }
 
+    /// Foreground process group of the terminal's PTY, read through its shell.
+    fn terminal_foreground_process_group(&self, terminal_id: &TerminalId) -> Option<u32> {
+        #[cfg(test)]
+        {
+            if let Some(pgid) = self.test_foreground_process_groups.get(terminal_id) {
+                return Some(*pgid);
+            }
+            if self
+                .terminal_runtimes
+                .get(terminal_id)?
+                .child_pid()
+                .is_none()
+            {
+                return crate::platform::process_group_id(std::process::id());
+            }
+        }
+        self.terminal_runtimes
+            .get(terminal_id)?
+            .child_pid()
+            .and_then(crate::platform::foreground_process_group_id)
+    }
+
+    /// Admit intent only from a reporter in the terminal's foreground process
+    /// group. A process that inherited the pane environment but lives in another
+    /// group (detached tmux, `setsid`, tool subprocesses) must not steer the
+    /// terminal's input method. Unknown peer or foreground fails closed.
+    fn input_intent_foreground_gate(
+        &self,
+        terminal_id: &TerminalId,
+        peer_pid: Option<u32>,
+    ) -> Result<(), ForegroundRejection> {
+        let peer_pgid = peer_pid.and_then(crate::platform::process_group_id);
+        let foreground_pgid = self.terminal_foreground_process_group(terminal_id);
+        match (peer_pgid, foreground_pgid) {
+            (Some(peer), Some(foreground)) if peer == foreground => Ok(()),
+            _ => Err(ForegroundRejection {
+                peer_pid,
+                peer_pgid,
+                foreground_pgid,
+            }),
+        }
+    }
+
     fn input_intents_changed(&mut self) {
         self.render_dirty.request_generic();
         self.render_notify.notify_one();
@@ -290,6 +368,30 @@ impl App {
             }
             _ => Err(OpenTargetError::InvalidRequest),
         }
+    }
+}
+
+#[derive(Debug)]
+struct ForegroundRejection {
+    peer_pid: Option<u32>,
+    peer_pgid: Option<u32>,
+    foreground_pgid: Option<u32>,
+}
+
+impl ForegroundRejection {
+    fn log(&self, method: &'static str, terminal_id: &TerminalId, session: &str) {
+        tracing::warn!(
+            event = "input_intent.foreground.reject",
+            subsystem = "api",
+            outcome = "rejected",
+            method,
+            terminal_id = %terminal_id,
+            session,
+            peer_pid = ?self.peer_pid,
+            peer_pgid = ?self.peer_pgid,
+            foreground_pgid = ?self.foreground_pgid,
+            "input intent reporter is not in the terminal foreground process group"
+        );
     }
 }
 
@@ -350,6 +452,7 @@ mod tests {
                 pane_id: Some(alias),
                 popup_terminal_id: None,
                 owner: session.into(),
+                peer_pid: Some(std::process::id()),
             }),
         }
     }
@@ -359,6 +462,7 @@ mod tests {
             id: "input-intent-operation".into(),
             method: Method::PaneInputIntentStreamOperation(PaneInputIntentStreamOperationParams {
                 session: session.into(),
+                peer_pid: Some(std::process::id()),
                 operation,
             }),
         }
@@ -428,6 +532,7 @@ mod tests {
                 pane_id: None,
                 popup_terminal_id: Some(wrong_id),
                 owner: "wrong-popup".into(),
+                peer_pid: Some(std::process::id()),
             }),
         });
         let wrong: serde_json::Value = serde_json::from_str(&wrong).unwrap();
@@ -440,6 +545,7 @@ mod tests {
                 pane_id: None,
                 popup_terminal_id: Some(popup_id.to_string()),
                 owner: "popup-reporter".into(),
+                peer_pid: Some(std::process::id()),
             }),
         });
         let opened = open_success(&opened);
@@ -601,5 +707,144 @@ mod tests {
         assert_eq!(ack["session"], "ack-reporter");
         assert_eq!(ack["scope"], "recorded");
         assert!(ack.get("id").is_none());
+    }
+
+    /// A real child in its own process group, standing in for a detached tmux
+    /// server or `setsid` tool subprocess that inherited the pane environment.
+    #[cfg(unix)]
+    struct OtherGroupPeer {
+        child: std::process::Child,
+        pgid: u32,
+    }
+
+    #[cfg(unix)]
+    impl OtherGroupPeer {
+        fn spawn() -> Self {
+            use std::os::unix::process::CommandExt as _;
+            let child = std::process::Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pgid = child.id();
+            assert_ne!(
+                Some(pgid),
+                crate::platform::process_group_id(std::process::id())
+            );
+            Self { child, pgid }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for OtherGroupPeer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    fn open_with_peer(alias: &str, session: &str, peer_pid: Option<u32>) -> Request {
+        let mut request = open_pane_request(alias.into(), session);
+        let Method::PaneInputIntentStreamOpen(params) = &mut request.method else {
+            unreachable!();
+        };
+        params.peer_pid = peer_pid;
+        request
+    }
+
+    #[cfg(unix)]
+    fn operation_with_peer(
+        session: &str,
+        operation: InputIntentOperation,
+        peer_pid: Option<u32>,
+    ) -> Request {
+        let mut request = operation_request(session, operation);
+        let Method::PaneInputIntentStreamOperation(params) = &mut request.method else {
+            unreachable!();
+        };
+        params.peer_pid = peer_pid;
+        request
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_rejects_a_peer_outside_the_foreground_process_group() {
+        let (mut app, alias, terminal_id) = app_with_pane_target();
+        let outsider = OtherGroupPeer::spawn();
+        // The pane's foreground job is this process's group; the outsider
+        // inherited the pane environment but lives in another group.
+        let response: serde_json::Value = serde_json::from_str(
+            &app.handle_api_request(open_with_peer(&alias, "outsider", Some(outsider.pid()))),
+        )
+        .unwrap();
+        assert_eq!(response["error"]["code"], "not_foreground_process_group");
+        assert!(app.terminal_input_intents().is_empty());
+
+        let unknown: serde_json::Value = serde_json::from_str(
+            &app.handle_api_request(open_with_peer(&alias, "unknown-peer", None)),
+        )
+        .unwrap();
+        assert_eq!(unknown["error"]["code"], "not_foreground_process_group");
+
+        // The same peer is accepted once its group becomes the foreground job.
+        app.test_foreground_process_groups
+            .insert(terminal_id, outsider.pgid);
+        open_success(&app.handle_api_request(open_with_peer(
+            &alias,
+            "outsider",
+            Some(outsider.pid()),
+        )));
+        assert_eq!(app.terminal_input_intents().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operations_from_a_peer_that_left_the_foreground_are_stale() {
+        let (mut app, alias, terminal_id) = app_with_pane_target();
+        let me = Some(std::process::id());
+        open_success(&app.handle_api_request(open_with_peer(&alias, "job", me)));
+        let activate = InputIntentOperation::Activate {
+            state: InputIntentState::Command,
+            policy: InputIntentPolicy::Mode,
+        };
+        let ack: serde_json::Value = serde_json::from_str(
+            &app.handle_api_request(operation_with_peer("job", activate.clone(), me)),
+        )
+        .unwrap();
+        assert_eq!(ack["ok"], true);
+        assert!(app.terminal_input_intents()[0].sessions[0].active);
+
+        // Another job takes the foreground; the earlier reporter is now background.
+        let other = OtherGroupPeer::spawn();
+        app.test_foreground_process_groups
+            .insert(terminal_id, other.pgid);
+        let ack: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(operation_with_peer(
+                "job",
+                InputIntentOperation::State {
+                    state: InputIntentState::Text,
+                },
+                me,
+            )))
+            .unwrap();
+        assert_eq!(ack["ok"], false);
+        assert_eq!(ack["error"], "STALE_LEASE");
+        assert!(app.terminal_input_intents().is_empty());
+
+        // Later operations stay stale, but the reporter may still close.
+        let ack: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(operation_with_peer("job", activate, me)))
+                .unwrap();
+        assert_eq!(ack["error"], "STALE_LEASE");
+        let ack: serde_json::Value = serde_json::from_str(&app.handle_api_request(
+            operation_with_peer("job", InputIntentOperation::Close {}, me),
+        ))
+        .unwrap();
+        assert_eq!(ack["ok"], true);
     }
 }

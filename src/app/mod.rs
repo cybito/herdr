@@ -108,6 +108,9 @@ pub struct App {
     pub(crate) pixel_mouse_available: bool,
     pub(crate) ime_control_enabled: bool,
     pub(crate) input_intents: crate::terminal::InputIntentStore,
+    #[cfg(test)]
+    pub(crate) test_foreground_process_groups:
+        std::collections::HashMap<crate::terminal::TerminalId, u32>,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
@@ -632,6 +635,8 @@ impl App {
             pixel_mouse_available: false,
             ime_control_enabled,
             input_intents: crate::terminal::InputIntentStore::default(),
+            #[cfg(test)]
+            test_foreground_process_groups: std::collections::HashMap::new(),
             terminal_runtimes: restored_terminal_runtimes,
             event_tx,
             event_rx,

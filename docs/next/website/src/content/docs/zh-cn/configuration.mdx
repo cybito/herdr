@@ -594,7 +594,7 @@ switch_ascii_input_source_in_prefix = true
 ime_control = true
 ```
 
-应用通过既有 Unix API 的 `pane.input_intent.stream` 报告自身 `command`/`text` 与生命周期。pane 使用 `HERDR_PANE_ID`，Popup 使用唯一 `HERDR_IME_POPUP_TERMINAL_ID`；`HERDR_IME_INTENT=1` 与 `HERDR_ENV=1` 先于 SSH/图形会话判断选择此 transport。缺失或矛盾 identity 只静默关闭该进程的 IME 增强，不猜 focused pane，也不回退到本机或 server 主机输入法。无 marker 时应用保留原有本地／SSH 行为。
+应用通过既有 Unix API 的 `pane.input_intent.stream` 报告自身 `command`/`text` 与生命周期。pane 使用 `HERDR_PANE_ID`，Popup 使用唯一 `HERDR_IME_POPUP_TERMINAL_ID`；`HERDR_IME_INTENT=1` 与 `HERDR_ENV=1` 先于 SSH/图形会话判断选择此 transport。server 只接受 terminal 当前前台进程组内的 reporter：连接的 socket 对端进程所在进程组必须等于该 terminal 的前台进程组（popup 同理），否则 open 返回 `not_foreground_process_group`；已打开的 reporter 之后发出 `activate`/`state`/`resume` 等操作时若已不在前台（如被放入后台、或另一个 job 接管前台），该会话立即被撤销并返回 `STALE_LEASE`。继承了 pane 环境却在其他进程组的进程（如 detached tmux、`setsid` 子进程）因此不能影响该 pane 的输入法。缺失或矛盾 identity 只静默关闭该进程的 IME 增强，不猜 focused pane，也不回退到本机或 server 主机输入法。无 marker 时应用保留原有本地／SSH 行为。
 
 server 的 `scope:recorded` ACK 只表示意图已保存。聚焦 client 将该意图映射到本机 `ime-control` lease；命令输入等待匹配当前 endpoint、terminal/app generation 与 focus episode 的 `scope:applied` ACK。text 只释放暂态英文，不强制选择中文。失焦、应用退出、terminal 关闭、断开／重连或 endpoint 切换时释放；无 reporter 的 shell 与 Popup 不借用其他 pane 的输入源。native 父程序在 child 返回或 SIGCONT 后保持 inactive，下一个真实 key/FocusIn 才按当前模式恢复。
 

@@ -68,6 +68,29 @@ impl InputIntentStore {
             .map(|session| session.session.as_str())
     }
 
+    pub(crate) fn terminal_for(&self, session: &str) -> Option<TerminalId> {
+        self.sessions
+            .iter()
+            .find(|record| record.session == session)
+            .map(|record| record.terminal_id.clone())
+    }
+
+    /// Retire one session as a superseded owner would be. Returns whether the
+    /// roster changed.
+    pub(crate) fn retire_session(&mut self, session: &str) -> bool {
+        let Some(record) = self
+            .sessions
+            .iter_mut()
+            .find(|record| record.session == session && record.lifecycle.included_in_roster())
+        else {
+            return false;
+        };
+        record.lifecycle = SessionLifecycle::Retired;
+        record.generation = record.generation.saturating_add(1);
+        self.rebuild_snapshot();
+        true
+    }
+
     pub(crate) fn generation_for(&self, session: &str) -> Option<u64> {
         self.sessions
             .iter()

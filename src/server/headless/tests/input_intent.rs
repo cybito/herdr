@@ -42,6 +42,7 @@ async fn canceled_stream_requests_do_not_reach_the_intent_store() {
                 pane_id: Some(pane_id.clone()),
                 popup_terminal_id: None,
                 owner: "reporter".into(),
+                peer_pid: Some(std::process::id()),
             }),
         },
         respond_to,
@@ -67,6 +68,7 @@ async fn canceled_stream_requests_do_not_reach_the_intent_store() {
             id: "canceled-operation".into(),
             method: Method::PaneInputIntentStreamOperation(PaneInputIntentStreamOperationParams {
                 session: "reporter".into(),
+                peer_pid: Some(std::process::id()),
                 operation: InputIntentOperation::Activate {
                     state: InputIntentState::Command,
                     policy: InputIntentPolicy::Mode,
@@ -91,6 +93,7 @@ async fn canceled_stream_requests_do_not_reach_the_intent_store() {
                 pane_id: Some(pane_id),
                 popup_terminal_id: None,
                 owner: "late-reporter".into(),
+                peer_pid: Some(std::process::id()),
             }),
         },
         respond_to,
@@ -235,6 +238,7 @@ fn update_reporter(server: &mut HeadlessServer, session: &str, operation: InputI
         server,
         Method::PaneInputIntentStreamOperation(PaneInputIntentStreamOperationParams {
             session: session.into(),
+            peer_pid: Some(std::process::id()),
             operation,
         }),
     );
@@ -274,6 +278,7 @@ async fn replacement_roster_includes_hidden_workspace_and_popup_sessions_for_eve
                 pane_id,
                 popup_terminal_id,
                 owner: session.into(),
+                peer_pid: Some(std::process::id()),
             },
         );
         update_reporter(
@@ -349,6 +354,7 @@ async fn suspended_parent_eof_replaces_roster_without_changing_the_active_child(
             pane_id: Some(pane_id.clone()),
             popup_terminal_id: None,
             owner: "parent".into(),
+            peer_pid: Some(std::process::id()),
         },
     );
     update_reporter(&mut server, "parent", InputIntentOperation::Enter {});
@@ -398,6 +404,7 @@ async fn suspended_parent_eof_replaces_roster_without_changing_the_active_child(
             pane_id: Some(pane_id),
             popup_terminal_id: None,
             owner: "child".into(),
+            peer_pid: Some(std::process::id()),
         },
     );
     update_reporter(
@@ -436,6 +443,7 @@ async fn suspended_parent_eof_replaces_roster_without_changing_the_active_child(
         &mut server,
         Method::PaneInputIntentStreamClose(PaneInputIntentStreamOperationParams {
             session: "parent".into(),
+            peer_pid: Some(std::process::id()),
             operation: InputIntentOperation::Close {},
         }),
     );
@@ -513,6 +521,7 @@ async fn moved_pane_keeps_its_reporter_identity_but_respawn_requires_a_new_repor
             pane_id: Some(pane_alias.clone()),
             popup_terminal_id: None,
             owner: "before-respawn".into(),
+            peer_pid: Some(std::process::id()),
         },
     );
     update_reporter(
@@ -598,6 +607,7 @@ async fn moved_pane_keeps_its_reporter_identity_but_respawn_requires_a_new_repor
         &mut server,
         Method::PaneInputIntentStreamOperation(PaneInputIntentStreamOperationParams {
             session: "before-respawn".into(),
+            peer_pid: Some(std::process::id()),
             operation: InputIntentOperation::Resume {
                 state: InputIntentState::Command,
             },
@@ -605,15 +615,50 @@ async fn moved_pane_keeps_its_reporter_identity_but_respawn_requires_a_new_repor
     );
     assert_eq!(stale["ok"], false);
     assert_eq!(stale["error"], "STALE_LEASE");
+    // The respawned shell owns a real PTY, so the foreground gate runs for
+    // real here: the shell's own group is foreground, this test process is not.
+    let shell_pid = server
+        .app
+        .terminal_runtimes
+        .get(&terminal_id)
+        .and_then(|runtime| runtime.child_pid())
+        .expect("respawned shell has a pid");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while crate::platform::foreground_process_group_id(shell_pid).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "respawned shell never became the PTY foreground group"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let background = intent_request(
+        &mut server,
+        Method::PaneInputIntentStreamOpen(PaneInputIntentStreamParams {
+            pane_id: Some(move_result.pane.pane_id.clone()),
+            popup_terminal_id: None,
+            owner: "background-reporter".into(),
+            peer_pid: Some(std::process::id()),
+        }),
+    );
+    assert_eq!(background["error"]["code"], "not_foreground_process_group");
     open_reporter(
         &mut server,
         PaneInputIntentStreamParams {
             pane_id: Some(move_result.pane.pane_id),
             popup_terminal_id: None,
             owner: "after-respawn".into(),
+            peer_pid: Some(shell_pid),
         },
     );
-    update_reporter(&mut server, "after-respawn", InputIntentOperation::Enter {});
+    let entered = intent_request(
+        &mut server,
+        Method::PaneInputIntentStreamOperation(PaneInputIntentStreamOperationParams {
+            session: "after-respawn".into(),
+            peer_pid: Some(shell_pid),
+            operation: InputIntentOperation::Enter {},
+        }),
+    );
+    assert_eq!(entered["ok"], true);
     server.render_and_stream();
     let renewed = recv_intent_snapshot(&control);
     let roster = renewed.input_intents.as_ref().unwrap();

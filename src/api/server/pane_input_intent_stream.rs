@@ -151,6 +151,8 @@ fn serve_with_timeout(
 
     let owner = next_owner();
     params.owner.clone_from(&owner);
+    let peer_pid = crate::platform::local_stream_peer_pid(&stream);
+    params.peer_pid = peer_pid;
     let open_gate = Arc::new(AtomicBool::new(true));
     let mut input = InputBuffer::default();
 
@@ -237,6 +239,7 @@ fn serve_with_timeout(
             server_stop,
             &mut input,
             request_timeout,
+            peer_pid,
         )
     })();
 
@@ -326,6 +329,7 @@ fn serve_operations(
     server_stop: Option<&Arc<AtomicBool>>,
     input: &mut InputBuffer,
     request_timeout: Duration,
+    peer_pid: Option<u32>,
 ) -> io::Result<()> {
     let mut operation_number = 0_u64;
     loop {
@@ -358,6 +362,7 @@ fn serve_operations(
             method: Method::PaneInputIntentStreamOperation(PaneInputIntentStreamOperationParams {
                 session: owner.to_owned(),
                 operation,
+                peer_pid,
             }),
         };
         let gate = Arc::new(AtomicBool::new(true));
@@ -699,6 +704,7 @@ fn close_session(request_id: &str, owner: &str, api_tx: &ApiRequestSender) {
         method: Method::PaneInputIntentStreamClose(PaneInputIntentStreamOperationParams {
             session: owner.to_owned(),
             operation: InputIntentOperation::Close {},
+            peer_pid: None,
         }),
     };
     let _response = super::dispatch_to_app_with_timeout(request, api_tx, Some(REQUEST_TIMEOUT));
@@ -718,6 +724,7 @@ mod tests {
             pane_id: Some("pane_alias".into()),
             popup_terminal_id: None,
             owner: String::new(),
+            peer_pid: None,
         }
     }
 
@@ -822,6 +829,8 @@ mod tests {
                 assert!(params.popup_terminal_id.is_none());
                 assert!(params.owner.starts_with("pane.input_intent.stream:"));
                 assert_ne!(params.owner, message.request.id);
+                // The transport, not the client, names the connecting process.
+                assert_eq!(params.peer_pid, Some(std::process::id()));
                 params.owner.clone()
             }
             other => panic!("expected stream open, got {other:?}"),
@@ -893,6 +902,7 @@ mod tests {
         match &enter.request.method {
             Method::PaneInputIntentStreamOperation(params) => {
                 assert_eq!(params.session, owner);
+                assert_eq!(params.peer_pid, Some(std::process::id()));
                 assert!(matches!(&params.operation, InputIntentOperation::Enter {}));
             }
             other => panic!("expected enter operation, got {other:?}"),
