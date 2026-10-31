@@ -1455,7 +1455,16 @@ impl ImeGate {
             } else if shell.outer_focused != Some(false) && !frozen {
                 semantic.push_back(event);
             } else {
-                discarded = true;
+                // Hover and wheel events reach an unfocused or frozen window
+                // without user intent to type; dropping them is not lost input.
+                discarded |= !matches!(&event, RawInputEvent::Mouse(mouse) if matches!(
+                    mouse.kind,
+                    MouseEventKind::Moved
+                        | MouseEventKind::ScrollDown
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollLeft
+                        | MouseEventKind::ScrollRight
+                ));
             }
         }
         if !semantic.is_empty() {
@@ -2745,6 +2754,52 @@ mod tests {
                 ImeGate::with_worker(None)
             })
         );
+    }
+
+    #[test]
+    fn unfocused_window_reports_dropped_typing_but_not_hover_or_wheel() {
+        let mouse = |kind| {
+            RawInputEvent::Mouse(MouseEvent {
+                kind,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let (mut gate, mut shell, registry, _) = fixture(Some(InputIntentState::Text));
+        shell.outer_focused = Some(false);
+        gate.enqueue(
+            &mut shell,
+            &registry,
+            Vec::new(),
+            vec![
+                mouse(MouseEventKind::Moved),
+                mouse(MouseEventKind::ScrollDown),
+                mouse(MouseEventKind::ScrollUp),
+            ],
+            None,
+            false,
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(shell.endpoint_error.is_none());
+        gate.enqueue(
+            &mut shell,
+            &registry,
+            Vec::new(),
+            vec![RawInputEvent::Key(crate::input::TerminalKey::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            ))],
+            None,
+            false,
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(shell
+            .endpoint_error
+            .as_deref()
+            .is_some_and(|message| message.starts_with("IME_INPUT_CANCELLED: 1 ")));
     }
 
     #[test]
